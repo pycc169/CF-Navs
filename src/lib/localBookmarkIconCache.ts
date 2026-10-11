@@ -1,8 +1,11 @@
-const CACHE_NAME = 'cf-navs-bookmark-icons-v1'
+import { CURRENT_EXTERNAL_ICON_CACHE_NAME, LEGACY_ICON_LOCAL_STORAGE_PREFIX } from './legacyIconCopyMigration'
+
+const CACHE_NAME = CURRENT_EXTERNAL_ICON_CACHE_NAME
 const MAX_LOCAL_ICON_CACHE_BYTES = 512 * 1024
 const CACHE_ORIGIN = 'https://cf-navs.local'
 const CACHE_PATH_PREFIX = '/bookmark-icon/'
-const STORAGE_PREFIX = 'cf-navs.bookmark-icon.'
+const TRANSIENT_OBJECT_ICON_TTL_MS = 30_000
+const MAX_TRANSIENT_OBJECT_ICONS = 64
 
 export type BookmarkIconCacheInput = {
   id: string | number
@@ -14,8 +17,14 @@ function canUseCacheStorage(): boolean {
   return typeof window !== 'undefined' && 'caches' in window
 }
 
-function canUseLocalStorage(): boolean {
-  return typeof window !== 'undefined' && 'localStorage' in window
+function isObjectIconProxyUrl(url: string): boolean {
+  if (url.startsWith('/api/icon/')) return true
+  try {
+    const parsed = new URL(url)
+    return typeof location !== 'undefined' && parsed.origin === location.origin && parsed.pathname.startsWith('/api/icon/')
+  } catch {
+    return false
+  }
 }
 
 function createHash(input: string): string {
@@ -30,10 +39,6 @@ function cacheRequest(cacheKey: string): Request {
   return new Request(`${CACHE_ORIGIN}${CACHE_PATH_PREFIX}${encodeURIComponent(cacheKey)}`, {
     method: 'GET',
   })
-}
-
-function localStorageKey(cacheKey: string): string {
-  return `${STORAGE_PREFIX}${cacheKey}`
 }
 
 function bookmarkCacheKeyPrefix(cacheKey: string): string | null {
@@ -54,20 +59,6 @@ function isBookmarkIconCacheRequest(request: Request, cacheKeyPrefix: string): b
   }
 }
 
-function cacheKeyFromRequest(request: Request): string | null {
-  try {
-    const url = new URL(request.url)
-    if (url.origin !== CACHE_ORIGIN || !url.pathname.startsWith(CACHE_PATH_PREFIX)) {
-      return null
-    }
-
-    const encodedKey = url.pathname.slice(CACHE_PATH_PREFIX.length)
-    return encodedKey ? decodeURIComponent(encodedKey) : null
-  } catch {
-    return null
-  }
-}
-
 async function deleteStaleCacheStorageEntries(cache: Cache, cacheKey: string): Promise<void> {
   const cacheKeyPrefix = bookmarkCacheKeyPrefix(cacheKey)
   if (!cacheKeyPrefix) return
@@ -83,36 +74,109 @@ async function deleteStaleCacheStorageEntries(cache: Cache, cacheKey: string): P
   )
 }
 
-function deleteStaleLocalStorageEntries(cacheKey: string): void {
-  if (!canUseLocalStorage()) return
+async function responseToIconBlob(response: Response): Promise<Blob | null> {
+  if (!response.ok) return null
 
-  const cacheKeyPrefix = bookmarkCacheKeyPrefix(cacheKey)
-  if (!cacheKeyPrefix) return
+  const contentType = response.headers.get('content-type') ?? ''
+  if (!contentType.toLowerCase().startsWith('image/')) return null
 
-  const currentKey = localStorageKey(cacheKey)
-  const staleKeyPrefix = `${STORAGE_PREFIX}${cacheKeyPrefix}`
-  try {
-    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
-      const key = localStorage.key(index)
-      if (key?.startsWith(staleKeyPrefix) && key !== currentKey) {
-        localStorage.removeItem(key)
-      }
-    }
-  } catch {
-    // Best-effort cleanup.
-  }
+  const blob = await response.blob()
+  return blob.size > 0 ? blob : null
 }
 
 function responseToObjectUrl(response: Response): Promise<string | null> {
-  if (!response.ok) return Promise.resolve(null)
+  return responseToIconBlob(response).then((blob) => (blob ? URL.createObjectURL(blob) : null))
+}
 
-  const contentType = response.headers.get('content-type') ?? ''
-  if (!contentType.toLowerCase().startsWith('image/')) return Promise.resolve(null)
+// 「经常访问」与普通分类会把同一本书签各挂一个 BookmarkCard，同一 tick 内对同一条对象代理
+// URL 发两次 fetch。对象图标是 no-store、不持久化，所以只能合并**在途**请求，不缓存完成结果：
+// 按完整 URL（含 v/cv/key）索引，拿到同一份正文后各自生成独立 object URL，成功或失败都立即移除，
+// 下一次挂载重新经过可见性闸门。
+export type BookmarkIconFetchResult = {
+  url: string | null
+  status: 'ready' | 'retryable' | 'unavailable'
+}
 
-  return response.blob().then((blob) => {
-    if (blob.size === 0) return null
-    return URL.createObjectURL(blob)
+type IconPayload = { blob: Blob | null; status: BookmarkIconFetchResult['status'] }
+
+async function responseToIconPayload(response: Response): Promise<IconPayload> {
+  if (!response.ok) {
+    return { blob: null, status: response.status === 408 || response.status === 429 || response.status >= 500 ? 'retryable' : 'unavailable' }
+  }
+  const blob = await responseToIconBlob(response)
+  // A 200 fallback is displayable, but must not stop recovery as if it were the
+  // real icon. Object responses are all no-store, so retries must remain bounded.
+  return { blob, status: response.headers.get('X-Icon-Fallback') === '1' || !blob ? 'retryable' : 'ready' }
+}
+
+const pendingObjectIcons = new Map<string, Promise<IconPayload>>()
+const transientObjectIcons = new Map<string, { blob: Blob; expiresAt: number }>()
+const OBJECT_ICON_TIMEOUT_MS = 10000
+
+function isPublicObjectIconUrl(url: string): boolean {
+  try {
+    return !new URL(url, typeof location !== 'undefined' ? location.href : CACHE_ORIGIN).searchParams.has('key')
+  } catch {
+    return false
+  }
+}
+
+function readTransientObjectIcon(url: string): Blob | null {
+  const cached = transientObjectIcons.get(url)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
+    transientObjectIcons.delete(url)
+    return null
+  }
+  transientObjectIcons.delete(url)
+  transientObjectIcons.set(url, cached)
+  return cached.blob
+}
+
+function writeTransientObjectIcon(url: string, blob: Blob): void {
+  transientObjectIcons.delete(url)
+  transientObjectIcons.set(url, { blob, expiresAt: Date.now() + TRANSIENT_OBJECT_ICON_TTL_MS })
+  while (transientObjectIcons.size > MAX_TRANSIENT_OBJECT_ICONS) {
+    transientObjectIcons.delete(transientObjectIcons.keys().next().value as string)
+  }
+}
+
+async function fetchObjectIconPayload(url: string): Promise<IconPayload> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new DOMException('Object icon response timed out', 'TimeoutError')
+      reject(error)
+      controller.abort(error)
+    }, OBJECT_ICON_TIMEOUT_MS)
   })
+  try {
+    // The deadline includes the response body. A headers-only success must not
+    // retain this URL's shared in-flight entry forever and prevent recovery.
+    return await Promise.race([
+      fetch(url, { credentials: 'same-origin', cache: 'force-cache', signal: controller.signal }).then(responseToIconPayload),
+      deadline,
+    ])
+  } finally { clearTimeout(timer) }
+}
+
+async function fetchObjectIcon(url: string, reuseCompleted = false): Promise<BookmarkIconFetchResult> {
+  if (reuseCompleted && isPublicObjectIconUrl(url)) {
+    const blob = readTransientObjectIcon(url)
+    if (blob) return { url: URL.createObjectURL(blob), status: 'ready' }
+  }
+  let pending = pendingObjectIcons.get(url)
+  if (!pending) {
+    pending = fetchObjectIconPayload(url)
+      .finally(() => pendingObjectIcons.delete(url))
+    pendingObjectIcons.set(url, pending)
+  }
+  const { blob, status } = await pending
+  if (reuseCompleted && status === 'ready' && blob && isPublicObjectIconUrl(url)) {
+    writeTransientObjectIcon(url, blob)
+  }
+  return { url: blob ? URL.createObjectURL(blob) : null, status }
 }
 
 
@@ -131,20 +195,11 @@ export function revokeLocalIconUrl(value: string): void {
 }
 
 export function readCachedBookmarkIconDataUri(cacheKey: string): string | null {
-  if (!canUseLocalStorage()) return null
-
-  try {
-    const value = localStorage.getItem(localStorageKey(cacheKey))
-    return value && isDataImage(value) ? value : null
-  } catch {
-    return null
-  }
+  void cacheKey
+  return null
 }
 
 export async function readCachedBookmarkIconUrl(cacheKey: string): Promise<string | null> {
-  const dataUri = readCachedBookmarkIconDataUri(cacheKey)
-  if (dataUri) return dataUri
-
   if (!canUseCacheStorage()) return null
 
   try {
@@ -164,12 +219,12 @@ export async function readCachedBookmarkIconUrl(cacheKey: string): Promise<strin
 }
 
 export async function deleteCachedBookmarkIcon(cacheKey: string): Promise<void> {
-  if (canUseLocalStorage()) {
-    try {
-      localStorage.removeItem(localStorageKey(cacheKey))
-    } catch {
-      // Best-effort cleanup.
+  try {
+    if (typeof window !== 'undefined' && 'localStorage' in window) {
+      window.localStorage.removeItem(`${LEGACY_ICON_LOCAL_STORAGE_PREFIX}${cacheKey}`)
     }
+  } catch {
+    // Best-effort cleanup.
   }
 
   if (!canUseCacheStorage()) return
@@ -184,77 +239,26 @@ export async function deleteCachedBookmarkIcon(cacheKey: string): Promise<void> 
 
 export async function writeBookmarkIconDataUri(cacheKey: string, dataUri: string): Promise<void> {
   if (!isDataImage(dataUri)) return
-
-  let storedInLocalStorage = false
-
-  if (canUseLocalStorage()) {
-    try {
-      deleteStaleLocalStorageEntries(cacheKey)
-      localStorage.setItem(localStorageKey(cacheKey), dataUri)
-      storedInLocalStorage = true
-    } catch {
-      // Browser storage can be disabled or full; Cache Storage remains a fallback.
-    }
-  }
-
-  if (!canUseCacheStorage()) return
-
-  try {
-    const cache = await caches.open(CACHE_NAME)
-    await deleteStaleCacheStorageEntries(cache, cacheKey)
-
-    if (storedInLocalStorage) {
-      await cache.delete(cacheRequest(cacheKey))
-      return
-    }
-
-    const response = await fetch(dataUri)
-    await cache.put(cacheRequest(cacheKey), response)
-  } catch {
-    // Local cache is an optimization; rendering should not depend on it.
-  }
+  await deleteCachedBookmarkIcon(cacheKey)
 }
 
-export async function pruneBookmarkIconCacheStorageBackedByLocalStorage(): Promise<number> {
-  if (!canUseCacheStorage() || !canUseLocalStorage()) return 0
+export async function fetchBookmarkIcon(
+  cacheKey: string,
+  url: string,
+  options: { reuseCompletedObject?: boolean } = {},
+): Promise<BookmarkIconFetchResult> {
+  if (!url) return { url: null, status: 'unavailable' }
 
   try {
-    const cache = await caches.open(CACHE_NAME)
-    const requests = await cache.keys()
-    let deleted = 0
-
-    await Promise.all(
-      requests.map(async (request) => {
-        const cacheKey = cacheKeyFromRequest(request)
-        if (!cacheKey) return
-
-        const dataUri = localStorage.getItem(localStorageKey(cacheKey))
-        if (!dataUri || !isDataImage(dataUri)) return
-
-        if (await cache.delete(request)) {
-          deleted += 1
-        }
-      }),
-    )
-
-    return deleted
-  } catch {
-    return 0
-  }
-}
-
-export async function fetchAndCacheBookmarkIconUrl(cacheKey: string, url: string): Promise<string | null> {
-  if (!url) return null
-
-  try {
+    if (isObjectIconProxyUrl(url)) return await fetchObjectIcon(url, options.reuseCompletedObject)
     const response = await fetch(url, {
       credentials: 'same-origin',
       cache: 'force-cache',
     })
-    if (!response.ok) return null
+    if (!response.ok) return { url: null, status: response.status >= 500 || response.status === 429 || response.status === 408 ? 'retryable' : 'unavailable' }
 
     const contentType = response.headers.get('content-type') ?? ''
-    if (!contentType.toLowerCase().startsWith('image/')) return null
+    if (!contentType.toLowerCase().startsWith('image/')) return { url: null, status: 'unavailable' }
 
     const cacheControl = response.headers.get('cache-control')?.toLowerCase() ?? ''
     const contentLengthHeader = response.headers.get('content-length')
@@ -264,6 +268,7 @@ export async function fetchAndCacheBookmarkIconUrl(cacheKey: string, url: string
       contentLength >= 0 &&
       contentLength <= MAX_LOCAL_ICON_CACHE_BYTES &&
       response.headers.get('X-Icon-Fallback') !== '1' &&
+      !isObjectIconProxyUrl(url) &&
       !/\bno-store\b/.test(cacheControl)
     if (canUseCacheStorage() && canPersist) {
       const cache = await caches.open(CACHE_NAME)
@@ -271,9 +276,10 @@ export async function fetchAndCacheBookmarkIconUrl(cacheKey: string, url: string
       await cache.put(cacheRequest(cacheKey), response.clone())
     }
 
-    return await responseToObjectUrl(response)
+    const { blob, status } = await responseToIconPayload(response)
+    return { url: blob ? URL.createObjectURL(blob) : null, status }
   } catch {
-    return null
+    return { url: null, status: 'retryable' }
   }
 }
 
@@ -294,4 +300,3 @@ export async function fetchCachedBookmarkIconUrl(
   }
   return { url, stale: false }
 }
-

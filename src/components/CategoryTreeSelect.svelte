@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from 'svelte'
+  import { afterUpdate, onDestroy, onMount, tick } from 'svelte'
   import {
     findCategoryTreeOption,
     getCategoryTreeExpandedRootIds,
@@ -16,6 +16,10 @@
   export let disabled = false
   export let compact = false
   export let testId = ''
+  // In a constrained parent menu, participate in its layout instead of escaping
+  // it as an absolute overlay. Other form controls retain the default overlay.
+  export let inlineMenu = false
+  export let onLayoutChange: (() => void) | undefined = undefined
 
   let root: HTMLElement | null = null
   let open = false
@@ -168,6 +172,8 @@
     if (open && root && !root.contains(event.target as Node)) closeMenu()
   }
 
+  afterUpdate(() => { if (inlineMenu) onLayoutChange?.() })
+
   onMount(() => {
     document.addEventListener('pointerdown', handleDocumentPointerDown)
   })
@@ -177,7 +183,7 @@
   })
 </script>
 
-<div class="category-tree-select" class:compact bind:this={root}>
+<div class="category-tree-select" class:compact class:inline-menu={inlineMenu} bind:this={root}>
   <button
     type="button"
     class="category-select-trigger"
@@ -239,6 +245,7 @@
               class="tree-option tree-root-option"
               class:selected={String(value) === String(item.id)}
               class:has-notice={!!item.notice}
+              title={item.title}
               data-tree-root-id={item.id}
               role="treeitem"
               aria-level="1"
@@ -248,7 +255,7 @@
               on:click={() => selectValue(item.id)}
             >
               <span class="tree-folder-mark" aria-hidden="true"></span>
-              <span>{item.title}</span>
+              <span class="tree-option-label">{item.title}</span>
               {#if item.notice}
                 <span class="tree-option-notice" id={`category-tree-notice-${item.id}`}>{item.notice}</span>
               {/if}
@@ -263,6 +270,7 @@
                   class="tree-option tree-child-option"
                   class:selected={String(value) === String(child.id)}
                   class:has-notice={!!child.notice}
+                  title={child.title}
                   data-tree-parent-id={item.id}
                   role="treeitem"
                   aria-level="2"
@@ -271,7 +279,7 @@
                   on:click={() => selectValue(child.id)}
                 >
                   <span class="tree-branch-mark" aria-hidden="true"></span>
-                  <span>{child.title}</span>
+                  <span class="tree-option-label">{child.title}</span>
                   {#if child.notice}
                     <span class="tree-option-notice" id={`category-tree-notice-${child.id}`}>{child.notice}</span>
                   {/if}
@@ -292,6 +300,24 @@
     min-width: 0;
     color: #0f172a;
     font-size: 14px;
+  }
+
+  .category-tree-select.inline-menu {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .inline-menu .category-select-trigger {
+    flex-shrink: 0;
+  }
+
+  .inline-menu .category-tree-menu {
+    position: static;
+    flex: 0 1 auto;
+    min-height: 0;
+    margin-top: 6px;
   }
 
   .category-select-trigger {
@@ -475,6 +501,16 @@
     font: inherit;
     text-align: left;
     cursor: pointer;
+  }
+
+  /* Dense inline menus keep names on one row; the full name remains in the
+     accessible text and title. Privacy notices retain their own wrapping row. */
+  .inline-menu .tree-option-label {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .tree-option:hover,

@@ -21,7 +21,7 @@
   - **鉴权与登录 fail-closed**：`validateSession` 拒绝会话（受保护端点因此 401 / `code=1001`），`POST /api/login` 返回 `code=1500` + `required SESSION binding is unavailable`。撤销名单不可用时不能静默放行——那等于「撤销名单不存在」而调用方无从得知。缺绑定是确定性的配置错误，`/install` 本来就以 `bindings_missing` 拒绝安装。
   - **best-effort 降级继续**：`POST /api/public/bookmarks/:id/click` 的点击计数限流在缺绑定或 KV 抛错时跳过限流但**仍然计数**。限流失效只是计数偏高，拒绝匿名点击会让公开首页的正常功能坏掉。
 - `/api/public/data`：匿名请求默认可查公开数据 edge cache；缓存未命中时先复用 `/api/config` edge cache，仍未命中才读取轻量 `site_title/public_mode`，公开模式关闭则要求有效 token，否则返回 `code=1005`，该轻量 1005 响应也会短时写入 edge cache。请求带 `Cache-Control: no-cache`、`Cache-Control: no-store`、`Cache-Control: max-age=0` 或 `Pragma: no-cache` 时，服务端必须绕过公开数据和站点配置 edge cache。
-- `/api/data/version`：用一次 `settings` 查询同时读取 `site_title`、`public_mode` 和内部 `data_version`，返回轻量版本号；公开模式关闭时匿名请求返回 `code=1005` 并携带轻量站点配置，登录态请求需通过 token 校验。这是每次页面加载都会走的热路径，查询条数是契约。
+- `/api/data/version`：用一次 `settings` 查询读取 `site_title`、`public_mode`、内部 `data_version` 与图标数据集代次。带 Bearer 时始终校验会话（包括公开模式），成功才返回 `auth_receipt`；无效会话返回 401，不能退回匿名成功。无 Bearer 的公开访问不产生认证回执，私有站点仍返回 `code=1005`。单次版本元数据查询是热路径契约；既有会话验证的 D1/KV 成本单独计量。
 
 ## 公开接口
 
@@ -34,7 +34,7 @@
 | POST | `/api/public/bookmarks/:id/click` | 无 | `null` |
 | POST | `/api/error-report` | 无 | `{ received: number }` |
 
-`/api/config` 使用短 TTL Cloudflare edge cache，设置保存或数据导入后会主动失效，主要作为兼容和兜底轻量配置接口。前端普通启动路径优先使用本地快照加 `/api/data/version` 做远端确认；本地无可用快照或版本变化时，才请求 `/api/public/data` 或 `/api/admin/data` 派生站点配置。公开模式关闭时，匿名 `/api/public/data` 的 1005 响应会在 `data` 中携带 `{ site_title, public_mode: false }`，登录页无需再额外请求 `/api/config`。该 1005 响应使用浏览器 `max-age=0` 和短 edge TTL，避免本地浏览器缓存卡住公开模式切换，同时减少私有站点匿名访问对 D1 的重复读取。`/api/public/data` 只查询并返回首页渲染需要的公开设置、分类和书签字段，书签公开字段携带用于轻量判断图标缓存的 `icon_cached`，`icon_blob` 恒为 `null`，但不包含 `admin_username`、`admin_password` 等内部字段，也不包含分类/书签的 `created_at`。**注意 `custom_css` 与 `custom_js` 属于公开设置**（见 `shared/settings.ts` 的 `PUBLIC_SETTINGS_KEYS`）：它们会随公开数据下发给每个匿名访客并在其浏览器中生效，这是「自定义 CSS/JS」这个功能的预期行为；未携带 no-cache 指令的匿名公开访问会先查短 TTL edge cache，命中时直接返回而不读取 D1。前端拉取完整聚合数据时默认带 `Cache-Control: no-cache`、`Pragma: no-cache` 和 fetch `cache: "no-store"`；服务端收到 no-cache 指令或带登录态请求时会绕过匿名缓存。缓存未命中时，服务端先复用或预热 `/api/config` 的轻量 edge cache 来判断是否公开，公开时再通过一次 D1 batch 聚合读取公开 settings、分类和书签；如果同一请求刚从 D1 读取过 `site_title/public_mode`，公开 settings 查询会跳过这两行并把已知值合并回响应。
+`/api/config` 使用短 TTL Cloudflare edge cache，设置保存或数据导入后会主动失效，主要作为兼容和兜底轻量配置接口。前端普通启动路径优先使用本地快照加 `/api/data/version` 做远端确认；本地无可用快照或版本变化时，才请求 `/api/public/data` 或 `/api/admin/data` 派生站点配置。公开模式关闭时，匿名 `/api/public/data` 的 1005 响应会在 `data` 中携带 `{ site_title, public_mode: false }`，登录页无需再额外请求 `/api/config`。该 1005 响应使用浏览器 `max-age=0` 和短 edge TTL，避免本地浏览器缓存卡住公开模式切换，同时减少私有站点匿名访问对 D1 的重复读取。`/api/public/data` 只查询并返回首页渲染需要的公开设置、分类和书签字段，书签公开字段携带用于轻量判断图标缓存的 `icon_cached`，`icon_blob` 恒为 `null`，但不包含 `admin_username`、`admin_password` 等内部字段，也不包含分类/书签的 `created_at`。**注意 `custom_css` 与 `custom_js` 属于公开设置**（见 `shared/settings.ts` 的 `PUBLIC_SETTINGS_KEYS`）：它们会随公开数据下发给每个匿名访客并在其浏览器中生效，这是「自定义 CSS/JS」这个功能的预期行为；未携带 no-cache 指令的匿名公开访问会先查短 TTL edge cache，命中时直接返回而不读取 D1。前端拉取完整聚合数据时默认带 `Cache-Control: no-cache`、`Pragma: no-cache` 和 fetch `cache: "no-store"`；服务端收到 no-cache 指令或带登录态请求时会绕过匿名缓存。缓存未命中时，服务端先复用或预热 `/api/config` 的轻量 edge cache 来判断是否公开，公开时再通过一次 D1 batch 聚合读取公开 settings、分类和书签；该 batch 同时读取 `site_title/public_mode`、数据版本和图标数据集代次，避免把先前配置与新数据版本拼接成不一致的权限快照。
 
 `/api/error-report` 接收前端运行时错误上报，payload 为 `{ errors: ErrorReportEntry[] }` 或单个 `ErrorReportEntry`。该接口不要求登录，但限制请求体为 16 KB、单批最多 10 条，并对消息、分类、URL 和行列字段做类型与长度归一化；有效请求通过 D1 原子计数按来源 IP 限制为每分钟 12 次，已封禁来源可由当前 Worker isolate 内存快速拒绝。超大请求返回 HTTP 413，高频请求返回 HTTP 429，无效 JSON 或无有效条目返回 HTTP 400。Worker 只把有限字段写入 `console.error`，响应中的 `received` 表示实际接收条数；前端会对同一错误做 60 秒去重，且上报失败不得影响页面主流程。
 
@@ -102,6 +102,8 @@
 
 `Category`、公开分类和 `CategoryUpsertReq` 均包含 `parent_id: number | null`。`null` 表示一级分类，非空值必须指向现有一级分类；服务端拒绝自身父级、三级结构，以及把仍有子分类的一级分类移动到其他父级。旧客户端更新请求缺少 `parent_id` 时保留当前父级，新建请求缺少该字段时创建为一级分类。
 
+分类创建与更新响应同时返回本次写入后的 `icon_revision`、`icon_write_epoch` 和 `icon_cached`，由同一条 SQL 的 `RETURNING` 取得，不新增回读查询，也不重复返回 `icon_blob` 正文。前端应用本地分类更新时必须保留这些图标身份字段和 `is_private`；不能用缺少元数据的投影覆盖实体、暂时回退为未知版本/代次 0，再依赖后台刷新修补。首页投影仅移除 `created_at`，字段边界与 `PublicCategory` 类型一致。
+
 `CategorySortReq` 为 `{ parent_id: number | null, ids: number[] }`。`ids` 必须与该父级作用域下的完整兄弟集合完全一致，服务端拒绝重复、缺失、跨父级或额外 ID。分类存在子分类时，单个删除和包含该分类的批量删除均返回冲突错误且不写入任何删除；无子分类时仅删除该分类及其直属书签。
 
 ## 书签接口
@@ -118,10 +120,10 @@
 | POST | `/api/bookmarks/batch-move` | `BookmarkBatchMoveReq` | `BookmarkBatchMoveResp` |
 | POST | `/api/bookmarks/sort` | `SortReq` | `null` |
 | POST | `/api/bookmarks/reorganize` | `BookmarkReorganizeReq` | `null` |
-| POST | `/api/bookmarks/:id/icon-cache/refresh` | 无 | `{ icon_blob: string \| null }` |
+| POST | `/api/bookmarks/:id/icon-cache/refresh` | 无 | `{ icon_blob, icon_descriptor, icon_update }` |
 | POST | `/api/bookmarks/check-health` | `{ ids: number[] }` | `{ id, status, ok }[]` |
 
-`POST /api/bookmarks/:id/icon-cache/refresh` 会按当前书签图标和 `icon_source` 刷新可持久化图标缓存：普通 HTTP(S) 图标在短超时时间内尝试写入 `bookmarks.icon_blob` 并返回 data URI，data URI 图标原样写入；Iconify、logo_surf 或非持久化来源会清空或跳过 `icon_blob`。前端只在编辑、保存等显式刷新动作调用该接口；编辑弹窗会先打开，再在后台触发刷新并把返回的 `icon_blob` 同步写入浏览器本地缓存。普通 HTTP(S) 图标抓取超时或失败时接口会尽快返回已有 `icon_blob` 或 `null`，前端可继续使用已保存的原始图标 URL 作为显示兜底。
+`POST /api/bookmarks/:id/icon-cache/refresh` 在当前源/写入代次下显式刷新成功图标，支持 data URI 及 HTTP(S)（含 Iconify），失败不覆盖最近成功正文。响应保留 `icon_blob`，并附 `icon_descriptor` 与 `icon_update`（updated/unchanged/cleared/unavailable）；并发保存获胜时返回重新读取的当前结果，不能返回旧源抓取结果。相同字节保持内容版本不变。响应为 `private, no-store`。浏览器能否保存仍须通过可信设备、当前会话与统一存储策略，不能因接口返回了 data URI 自动认领权限。
 
 批量删除请求最多包含 500 个正整数 ID；排序请求的 `ids` 最多 5000 个；服务端会去重并忽略已不存在的记录。书签 `url` 必须是 `http(s)` 地址，其它协议返回 `code=1002`；后台表单会先把缺协议的写法（`example.com`）补成 `https://` 再提交，补不了的原样送出由服务端拒绝。书签写入可携带 `description_mode: "always" | "hover" | "hidden" | null`；更新时省略该字段会保留原覆盖值，显式 `null` 会恢复跟随全局设置。
 `POST /api/bookmarks/batch-move` 用于管理员批量移动书签，不改变 `/api/bookmarks/reorganize` 的完整排序契约。请求为 `{ ids: number[], category_id: number, position: 'end' | 'start', expected: { id: number, category_id: number, sort: number }[] }`；`ids` 最多 500 个且不得重复，`expected` 必须与 `ids` 一一对应，用于拒绝过期集合。`position='end'` 追加到目标分类现有书签末尾，`position='start'` 插入目标分类开头；默认由前端传 `end`。服务端必须在一次原子操作中更新选中书签的 `category_id` 和受影响书签的全局 `sort`，校验失败不得部分成功。选中集合、快照、目标分类或权限不一致返回 `code=1006`（`ErrCode.CONFLICT`）；其它服务端故障返回 `code=1500`。成功返回 `{ moved, category_id, position }`。
@@ -162,25 +164,29 @@
 | GET | `/api/fetch-favicon?url=` | 登录 | 服务端依次解析目标站 `<link rel="icon">`、Web App Manifest `icons[]`、`/favicon.ico`，失败或超时回退 `favicon.im` |
 | GET | `/api/iconify-search?query=` | 登录 | 搜索 Iconify 候选并返回预览地址 |
 | GET | `/api/icon-access` | 登录 | 签发后台预览私密对象图标用的短期授权，返回 `IconAccessResp`。响应 `private, no-store` |
-| GET | `/api/icon/:id` | 无 | 书签图标代理，**只对匿名可见的书签返回真实图标**（见下方可见性规则）。通过判定后优先返回 Cloudflare edge cache；cache miss 时读取书签的图标地址、标题与 D1 中缓存的 `icon_blob`；无 blob 时按书签保存的 HTTP(S) 图标地址服务端抓取并写回 D1；普通 HTTP(S) 外站抓取失败、图标缺失、非 HTTP(S) 值或缓存损坏时返回临时 SVG 文字图标，并带 `X-Icon-Fallback: 1`（缓存策略见下方「图标抓取失败的两种兜底」） |
-| GET | `/api/category-icon/:id` | 无 | 分类图标代理，**只对匿名可见的分类返回真实图标**（见下方可见性规则）。优先返回 Cloudflare edge cache；cache miss 时一次读取全部分类，同时算出可见集合与目标分类；HTTP(S) 分类图标由 Worker 服务端抓取；外站失败或图标缺失时返回临时 SVG 文字图标，并带 `X-Icon-Fallback: 1`（缓存策略见下方「图标抓取失败的两种兜底」） |
+| GET | `/api/icon/:id` | 无 | 书签图标代理。匿名请求先读取目标书签及所属分类祖先链做当前可见性判定，再允许命中 Cloudflare edge cache；不可见/未知对象返回不含标题与域名的 `no-store` 文字兜底，公开对象 cache miss 时读取图标地址、标题与 D1 中缓存的 `icon_blob`，无 blob 时按书签保存的 HTTP(S) 图标地址服务端抓取并写回 D1 |
+| GET | `/api/category-icon/:id` | 无 | 分类图标代理。匿名请求先读取目标分类及祖先链做当前可见性判定，再允许命中 Cloudflare edge cache；不可见/未知对象返回 `no-store` 文字兜底，公开对象 cache miss 时服务端抓取 HTTP(S) 分类图标。Service Worker 不再 cache-first 拦截该路径 |
 | GET | `/api/iconify/:set/:name.svg` | 无 | Iconify 图标预览代理。新增/编辑书签弹窗通过该同源代理预览，成功响应可被 Cloudflare edge cache 复用；失败时返回临时 SVG 文字图标并带 `X-Icon-Fallback: 1`（缓存策略见下方「图标抓取失败的两种兜底」） |
 
-**图标端点的匿名可见性规则。** `/api/icon/:id` 与 `/api/category-icon/:id` 按可猜测的整数 ID 寻址且不要求登录，因此两者都在返回真实图标前做一次可见性判定，口径与 `/api/public/data` 完全一致：私密书签不可见；公开书签只要挂在私密分类（或私密分类的后代）下同样不可见；私密分类及其后代不可见。层级规则复用 `getPublicCategoryIds` 的祖先链遍历，不在图标端点重复实现。被拒绝的请求返回**不含标题与域名**的兜底 SVG（`public, max-age=300`，带 `X-Icon-Fallback: 1`），与「ID 不存在」的响应完全一致，不提供存在性或内容线索——兜底 SVG 会渲染标题前 4 个字符或 URL 的 hostname，所以这两条路径必须传空标题与空 URL。只有 HTTP 400（非正整数 ID）走 `no-store`。
+**图标端点的匿名可见性规则。** `/api/icon/:id` 与 `/api/category-icon/:id` 按可猜测的整数 ID 寻址且不要求登录，因此两者都在**共享 edge cache 命中之前**做当前可见性判定，口径与 `/api/public/data` 完全一致：私密书签不可见；公开书签只要挂在私密分类（或私密分类的后代）下同样不可见；私密分类及其后代不可见；分类缺失、祖先链循环或无法读取权威元数据也按不可见处理。层级规则复用 `getPublicCategoryIds` 的祖先链遍历。被拒绝的请求返回**不含标题与域名**、`Cache-Control: no-store` 的兜底 SVG，与「ID 不存在」的响应完全一致，不提供存在性或内容线索。
 
 **私密对象的授权预览（`key` 参数）。** 后台需要看到私密书签/私密分类的真实图标，而 `<img>` 不发 `Authorization` 头，因此两个端点接受 `?key=<授权>`：
 
 - 授权由 `GET /api/icon-access` 签发，形如 `<exp 毫秒时间戳>.<base64url(HMAC-SHA256)>`。签名密钥就是 `settings.jwt_secret`，**改密码触发的 `rotateJwtSecret` 会顺带作废全部已签发授权**；签名内容带域分隔前缀 `icon-access:`，所以授权串与 JWT 互不通用。
 - **寿命 30 分钟，刻意远短于会话（默认 30 天）**。授权是放在 URL 里的能力凭据，会进浏览器历史、Referer 与访问日志；它又不查 KV 撤销名单（每张私密图标一次 KV 读会打穿 `C-5` 的图标请求预算），因此登出后无法立即失效——短寿命是唯一的补偿，前端在临近过期前续签。
 - 校验**先看形状与过期，再算 HMAC**：否则任意长度的 `key=` 都会换来一次 HMAC 运算，等于给匿名请求开一条计算放大路径。非法或过期的 `key` 一律**退回匿名口径**，响应与不带 `key` 时逐字节相同。
-- 带合法授权的响应是 `private, no-store`，且**既不读也不写 edge cache**（`cacheKey` 为 `null`）。判定必须发生在 cache 命中查询之前：命中查询用的键不含身份，先查就会把写给匿名访客的兜底图标返回给管理员。`public/sw.js` 的 `cacheIconResponse` 另外显式拒收 `no-store` 响应——Cache Storage 不会自己遵守 `Cache-Control`，而 `/api/category-icon/*` 是 cache-first，不拒收就会把私密图标留在本机并被后续访客态命中。
-- 前端只在**后台**带 `key`（分类列表、书签列表、访问分析）。首页公开卡片不带，否则公开图标响应会退化成 `private, no-store`，白丢 edge cache 与 SW 缓存。
+- 带合法授权的响应是 `private, no-store`，且**既不读也不写 edge cache**（`cacheKey` 为 `null`）。`public/sw.js` 不接管 `/api/category-icon/*`；Cache Storage 只缓存不含 `no-store` 的 Iconify 资源，不保存用户对象图标。
+- 前端只在登录态且对象需要授权时带 `key`；公开对象保持匿名 URL，继续使用 edge cache。非法或过期 `key` 一律退回上述匿名口径。
 
-判定发生在 cache 命中查询**之后**（匿名路径），因此收紧判定口径时必须同时递增 `worker/lib/iconResponses.ts` 的 `ICON_CACHE_NAMESPACE`：edge cache 的键不含身份，旧条目是在没有判定的情况下写入的，`s-maxage` 为 6 天，只加服务端过滤不会让它们失效。命名空间体现在缓存键的 `ns` 参数上，与前端用于图标更新失效的 `v` 参数并存；`key` 参数会被键归一化丢弃，所以伪造的 `key` 不会让缓存条目碎片化。可见性判定给 `/api/icon/:id` 的 cache miss 增加一次分类表读取（`/api/category-icon/:id` 不增加，它本来就要读分类），命中路径不受影响，同源请求数也不变。
+匿名公开图标的客户端响应统一使用 `Cache-Control: no-store`，避免站点级 Browser Cache TTL（例如共享域名的 4 小时默认值）把可撤回的图标留在访问者浏览器；Worker 内部的 `caches.default` 仍分别保留真实图标 `s-maxage=518400` 与永久缺图 `s-maxage=300`。公开对象命中 edge cache 后也必须重新包装为客户端 `no-store`，不能直接透传缓存副本的公开头。发布时递增 icon cache namespace 与 Service Worker cache 版本，使旧 edge/SW 条目不可达；浏览器已经保存的旧 HTTP cache 无法远程撤回，因此客户端 URL 版本也要递增。
 
-**真实图标与兜底图标的缓存策略是分开的**：真实图标 `public, max-age=7 天, s-maxage=6 天, immutable`，兜底图标只 `public, max-age=300, s-maxage=300`。兜底刻意短命，好让后来补上的真实图标很快生效——按成功策略缓存兜底等于把「暂时没有图标」钉死一周。
+**代码级缓存分离。** 只有 `/api/icon/:id` 与 `/api/category-icon/:id` 使用「Edge 可缓存、客户端 no-store」边界；`/api/iconify/*` 和站点元信息继续使用各自的公开缓存策略。合法授权响应继续 `private, no-store`，不读写共享 edge cache。对象代理响应不会持久化到浏览器对象图标缓存；当前 `cf-navs-bookmark-icons-v2` 仅可保存允许本地优化的原始外站图标，`v1` 仅作为旧版本迁移清理目标。这是隐私撤回优先于对象图标本地命中率的有意取舍。
 
-**图标抓取失败的两种兜底。** Worker 抓取外站图标失败时按性质分流，不再一律返回同一种可缓存的兜底：`404`/`410`、返回内容不是图片（认证墙、登录页）或超出大小上限记为**图标不存在**（`missing`），兜底 SVG 沿用 `public, max-age=300, s-maxage=300`——这类失败重试没有意义，不缓存等于每次访问都打一次上游。超时、网络错误、`429`/`5xx`、空 body 记为**瞬时失败**（`transient`），兜底 SVG 一律 `no-store`：它是 `200 + image/svg+xml`，与真实图标在缓存和网络面板里完全一样，一旦写进 edge、Service Worker 或浏览器，访客会在整个缓存期内持续看到文字兜底，而请求看起来是成功的（实测并发抓取一屏图标时上游会成批瞬时失败）。`public/sw.js` 的 `cacheIconResponse` 按 `no-store` 拒收，所以瞬时失败的兜底不会留在本机；带合法 `key` 的授权路径本来就是 `private, no-store`，两种性质在响应上没有区别。前端 `CategoryIcon.svelte` 对 `<img>` 的加载失败重试一次（`&retry=1`），重试仍失败才显示标题首字，并在图标或授权 key 变化时重新计数。
+真实图标与兜底图标的缓存策略仍然分开：公开真实图标可在 edge cache 复用，但客户端不保存；公开对象的永久缺图兜底可使用短 `s-maxage=300`，客户端仍为 `no-store`；隐私拒绝/未知对象的兜底不进入共享缓存。
+
+
+**图标抓取失败的两种兜底。**
+- 图标确实不存在（`missing`）时，Worker 内部 edge cache 使用 `s-maxage=300`；返回浏览器的响应仍为 `no-store`。超时、网络错误、`429`/`5xx`、空 body 等瞬时失败一律 `no-store`。隐私拒绝/未知对象的兜底也一律 `no-store`，不能写入共享缓存。
 
 图标来源包括：
 
@@ -191,13 +197,15 @@
 - `iconify`：使用 Iconify SVG API，保存格式为 `https://api.iconify.design/{set}/{name}.svg`，例如 `mdi:home` 或 `https://icon-sets.iconify.design/mdi/home/` 会转换为 `https://api.iconify.design/mdi/home.svg`；新增/编辑弹窗会展示 Iconify 候选，候选、手动输入预览和 icon-sets 页面链接都通过 `/api/iconify/{set}/{name}.svg` 代理加载。
 - `custom`：手动填写 URL、表情、纯文字或图床地址。非 URL / 非 data URI 的值会在首页按文本图标直接渲染。
 
-创建或更新书签后，前端会对普通 HTTP(S) 图标显式调用刷新接口，尽量缓存到 `bookmarks.icon_blob`；Iconify 图标和 icon-sets 页面链接不写入 `icon_blob`，后台预览由 `/api/iconify/:set/:name.svg` 和 Cloudflare edge cache 复用。更新书签但图标地址或图标来源未改变时不会清空已有 `icon_blob`。**聚合响应不下发 `icon_blob`（该字段为 `null`），而以 `icon_cached` 表示 D1 中是否已有持久化缓存**；首页据此配合浏览器本地图标缓存、`/api/icon/:id` 兼容路径或已保存的普通 HTTP(S) URL 取得图标。普通渲染不把 `/api/icon/:id` 直接挂载到首页 `<img>` 上；本地缓存未命中且 `icon_cached=true` 时，首页先抓取一次该稳定代理 URL 并写入浏览器 Cache Storage，再使用得到的本地对象 URL；只有编辑/保存等显式刷新动作会调用刷新接口。HTTP(S) 分类图片使用 `/api/category-icon/:id?v=...`，data URI、文字和表情分类图标直接渲染；一级标题、二级标签、搜索分组和折叠导航复用相同解析与图片失败回退规则。已保存的 Iconify 书签图标首页可直接使用标准 Iconify SVG URL，并依赖浏览器 HTTP 缓存复用；后台预览仍使用稳定的 `/api/iconify/:set/:name.svg`。
+创建或更新书签后，前端会对普通 HTTP(S) 图标显式调用刷新接口，尽量缓存到 `bookmarks.icon_blob`；普通 Iconify 预览与 icon-sets 页面链接不主动写入 `icon_blob`（显式刷新和可信副本协议可取得并版本化成功图片），新增/编辑弹窗、后台预览和首页展示都通过 `/api/iconify/:set/:name.svg` 同源代理，由 Cloudflare edge cache 复用。更新书签但图标地址或图标来源未改变时不会清空已有 `icon_blob`。**聚合响应不下发 `icon_blob`（该字段为 `null`），而以 `icon_cached` 表示 D1 中是否已有持久化缓存**；首页据此取得图标：已有 `icon_blob` 时使用内嵌 data URI，普通 HTTP(S) 图标在缺少本地副本时读取 `/api/icon/:id` 当前响应并仅用于当前渲染，不再写入浏览器 Cache Storage；失败时回退到保存的原始 HTTP(S) 图标 URL。HTTP(S) 分类图片使用 `/api/category-icon/:id?v=...`，data URI、文字和表情分类图标直接渲染；一级标题、二级标签、搜索分组和折叠导航复用相同解析与图片失败回退规则。
 
-前端普通渲染普通 HTTP(S) 书签图标时应读取聚合数据中的 `icon_cached` 轻量标志，不应假设聚合响应携带二进制 `icon_blob`；本地缓存缺失时，若 `icon_cached=true` 先把 `/api/icon/:id` 响应写入 `cf-navs-bookmark-icons-v1`；单个自动写入响应不超过 512 KiB；代理响应失败后再使用保存的原始 HTTP(S) 图标 URL 兜底。不要直接把 `/api/icon/:id` 挂载到首页 `<img>`，后台列表仍可把 `/api/icon/:id` 作为兼容预览入口——对私密对象需要附带 `GET /api/icon-access` 签出的 `key` 才能得到真实图标，不带 `key` 时只返回兜底图标。持久化的 Iconify 图标首页可使用标准 `https://api.iconify.design/*.svg`，由浏览器 HTTP 缓存复用，避免每张图标都占用一次同源 Worker 请求。
+前端普通渲染普通 HTTP(S) 书签图标时应读取聚合数据中的 `icon_cached` 轻量标志，不应假设聚合响应携带二进制 `icon_blob`；`/api/icon/:id` 与 `/api/category-icon/:id` 的客户端响应统一 `no-store`，公开复用只发生在 Worker edge cache。旧版 `cf-navs-bookmark-icons-v1` 会在新本地缓存初始化时清理；原始外站图标仍可按大小和响应头写入新的本地优化缓存。后台列表仍可把 `/api/icon/:id` 作为兼容预览入口——对私密对象需要附带 `GET /api/icon-access` 签出的 `key` 才能得到真实图标，不带 `key` 时只返回兜底图标。当前首页的 Iconify 展示通过 `/api/iconify/:set/:name.svg` 同源代理；标准 `https://api.iconify.design/*.svg` 仅作为规范化存储值和兼容外部资源路径保留。
 
 HTTP(S) 图标抓取成功后，代理会直接返回图片字节并写入 Cloudflare edge cache；只有书签图标需要写入 `bookmarks.icon_blob` 时才生成 base64 data URI，避免 Iconify 预览和分类图标在 Worker 内部做不必要的 base64 编解码。
 
 公开聚合、后台聚合、书签列表和图标详情等读取路径默认直接执行查询，避免每个 Worker isolate 冷启动都先跑 `PRAGMA table_info`。如果遇到旧库缺列错误，后端会执行一次兼容 schema 检查/迁移并重试当前查询。
+
+普通书签/分类代理的 `v` 必须包含聚合数据已有的 `icon_revision`，未知时回退至 `icon_write_epoch`。快照可能省略图片来源和正文，仅用来源、标题或网址不能区分“只换图”的新内容。已知 revision 不变时不因写入代次单独变化更换版本；版本计算在前端完成，不增加服务端查询或改变权限、no-store 与 SW 边界。
 
 ## 首页搜索行为
 
@@ -298,3 +306,19 @@ HTTP(S) 图标抓取成功后，代理会直接返回图片字节并写入 Cloud
 `ImportReq.mode` 支持 `replace` 和 `merge`。单次导入最多 2000 个分类、20000 个书签，超出返回 `code=1002` 并在 msg 中给出上限。协议不合规的书签会被**跳过而不是让整批导入失败**——为了一条 `javascript:` 小书签让整次备份恢复失败是更糟的结果：缺协议的写法补成 `https://` 保留，`javascript:` / `data:` / `file:` / `ftp:` 等一律丢弃并计入 `ImportResp.skipped_bookmarks`。旧备份缺少 `parent_id` 时按一级分类处理。合并模式按去除首尾空格、忽略大小写的完整分类路径复用现有分类，因此不同父分类下允许同名子分类；重复 URL 保留，当前站点设置保持不变。
 
 导入在写入前验证分类深度、父级引用和书签分类引用。覆盖和合并都会先建立旧分类 ID 到新分类 ID 的映射，按一级分类、二级分类、书签的顺序重建，并同时重写二级分类 `parent_id` 与书签 `category_id`。设置仅在覆盖导入中写入受支持的公开配置 key，不触碰管理员账号字段。`ImportResp` 包含导入数量和导入后的 `AdminData`，前端使用该响应更新本地数据并显式同步导入状态。
+
+## 可信设备图标数据协议
+
+共享类型见 `shared/iconLocalCopy.ts`。本节描述服务端数据协议，不代表任意浏览器已开启可信持久化。
+
+- `POST /api/icon-local-copy` 必须通过 Bearer 会话鉴权；一期只接受 `object_type=bookmark`。请求为 `IconCopyRequest`：protocol=1、对象类型/ID、dataset_epoch、expected_write_epoch、expected_content_revision（未知为 null）。请求体最多 4 KiB，同源 Origin 检查，不接受图标 key 或摘要代替会话。
+- 成功为统一包络内的 `IconCopyResult`，携带 protocol=1、persistence=session-scoped、当前描述及 image（MIME、byte_length、base64）；empty/text 返回 image=null。图片上限 512 KiB，版本是规范 MIME 与实际字节的 SHA-256，不是 URL 或应用构建号。
+- 401 为未通过认证；未知对象 404；描述冲突 409 且只返回当前描述；无效/不支持请求 400；暂时无法取得真实成功图片 503。正文中 reason 可区分 conflict/unavailable/unsupported。所有结果均禁止共享及不可控 HTTP 缓存。
+- 传输使用 private/no-store、CDN no-store；只有已知协议的成功应用数据可在本机许可内物化，不克隆原 HTTP 响应。普通对象代理 no-store 拒收与 SW 不接管策略不变。
+- 聚合和版本响应在迁移完成后附 dataset_epoch 与 icon_local_copy_protocol=1。已鉴权响应的 auth_receipt 含 cache_scope、checked_at、expires_at（毫秒）；cache_scope 是非凭据会话标识，不能独立授权。图片下载不续租，图标 key 不续租；回执遵循原有会话撤销缓存窗口。
+- 书签轻量字段 icon_revision/icon_write_epoch 与聚合数据的 version、dataset_epoch 同批读取。内部数据集代次不进入用户 Settings 或可信备份输入；导入重建表时原子更换代次，返回带新身份的聚合数据。当前 merge 也通过重建/重映射实现，因此同样更换代次。
+- setIconBlob 条件提交保护数据集、源、代次和预期正文/版本；legacy SQL 改正文时摘要失效，改源时同时清旧正文。已发布内容变化与 data_version 在同一数据库更新边界发布；仅补充未知摘要不逐图触发全量刷新。
+
+## HTML 入口响应策略
+
+非 API 的 HTML 入口继续使用再验证缓存，并禁止代理修改正文（`no-transform`）。Worker HTML 响应与直接静态资源入口的规则均来自 `worker/lib/assetHeaders.ts`，由构建生成静态入口规则并纳入离线外壳指纹；API 的鉴权、私密响应与 no-store 契约不因此改变。严格脚本策略及自动注入统计的取舍见 `SECURITY.md`。

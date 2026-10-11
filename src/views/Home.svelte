@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte'
+  import { observeSortToolbar } from '../lib/homeSortToolbar'
   import { observeSearchBoxVisibility } from '../lib/searchBoxVisibility'
   import Sidebar from '../components/Sidebar.svelte'
   import CategorySection from '../components/CategorySection.svelte'
@@ -30,6 +31,8 @@
   } from '../lib/homeData'
   import { CARD_SIZE_DEFAULTS, CATEGORY_DISPLAY_DEFAULTS } from '../../shared/settings'
   import { buildCategoryTreeOptions } from '../lib/categorySelect'
+  import { getPublicCategoryIds } from '../lib/adminListState'
+  import { iconAccessKey } from '../lib/iconAccessKey'
   import { getErrorMessage } from '../lib/api'
   import { reorderByIds } from '../lib/reorder'
   import { buildHomeSortCategoryOrders, moveBookmarkToCategory } from '../lib/homeSort'
@@ -85,6 +88,8 @@
   let homeSortSaving = false
   let homeSortDraft: PublicBookmark[] = []
   let homeSortError = ''
+  let homeSortBottomInset = 0
+  function setSortToolbarInset(inset: number): void { homeSortBottomInset = inset }
   let lastFocusedCategoryId: number | null = null
 
   $: sortedCategories = homeData.getSortedCategories(categories)
@@ -117,6 +122,11 @@
   $: visibleCategories = visibleCategoryForest.flatMap((category) => [category, ...category.children])
   $: visibleCategoryBookmarks = groupBookmarksByCategory(visibleBookmarks)
   $: categoryTreeOptions = buildCategoryTreeOptions(sortedCategories)
+  // 登录态下首页会渲染私密书签，其图标必须带授权 key 才拿得到真实图片（Issue #28）。
+  // 用「对匿名可见的分类集合」判定：不在其中的分类（私密树，或已被删除）都需要授权 key；
+  // 公开分类下的公开书签留空以保留共享缓存。
+  $: publicCategoryIds = getPublicCategoryIds(sortedCategories)
+  $: visibleIconAccessKey = isAuthenticated ? $iconAccessKey : ''
   $: mostVisitedBookmarks = hasSearchQuery
     ? []
     : getMostVisitedBookmarks(sortedBookmarks, settings?.most_visited_count ?? 8)
@@ -140,6 +150,7 @@
   $: categoryDisplay = settings?.category_display ?? CATEGORY_DISPLAY_DEFAULTS
   $: cardTextColor = settings?.card_text_color?.trim() ?? ''
   let topNavHeight = 0
+  let topNavBottom = 0
   // 顶部分行导航高度增长时，用实测高度驱动首页顶部留白（+ 12px 顶距 + 12px 余量）。
   $: topNavPadding = isTopNavigation && topNavHeight > 0 ? `${Math.round(topNavHeight + 24)}px` : ''
   $: homeShellStyle = [
@@ -147,6 +158,8 @@
     `--content-margin-x: ${contentLayout.margin_x}px`,
     `--content-margin-top: ${contentLayout.margin_top}%`,
     `--content-margin-bottom: ${contentLayout.margin_bottom}%`,
+    `--home-sort-bottom-inset: ${homeSortBottomInset}px`,
+    `--home-top-inset: ${isTopNavigation ? topNavBottom : 0}px`,
     `--category-root-font-size-base: ${categoryDisplay.root_font_size}px`,
     `--category-root-icon-size-base: ${categoryDisplay.root_icon_size}px`,
     `--category-child-font-size-base: ${categoryDisplay.child_font_size}px`,
@@ -457,6 +470,9 @@
     onNavigate={handleNavigate}
     onPersistentExpansionChange={(expanded) => (persistentLeftExpanded = expanded)}
     onTopNavHeightChange={(height) => (topNavHeight = height)}
+    onTopNavBottomChange={(bottom) => (topNavBottom = bottom)}
+    {publicCategoryIds}
+    iconAccessKey={visibleIconAccessKey}
   />
 
   <div class="content-layout" bind:this={contentAnchor}>
@@ -476,8 +492,8 @@
               <section class="search-category-group" aria-labelledby={`search-category-${category.id}`}>
                 <header class="search-group-header">
                   <div class="search-group-title">
-                    {#if category.icon}
-                      <CategoryIcon category={category} size="var(--category-root-icon-size, 38px)" className="search-category-icon" />
+                    {#if category.icon || category.icon_display === 'image'}
+                      <CategoryIcon category={category} size="var(--category-root-icon-size, 38px)" className="search-category-icon" iconAccessKey={publicCategoryIds.has(Number(category.id)) ? '' : visibleIconAccessKey} />
                     {/if}
                     <h2 id={`search-category-${category.id}`} style={`font-size: var(--category-root-font-size, 1.28rem)`}>{category.title}</h2>
                   </div>
@@ -504,6 +520,9 @@
                       canSort={false}
                       onAddBookmark={onOpenCreateBookmark}
                       onEditBookmark={onEditBookmark}
+                      publicCategoryIds={publicCategoryIds}
+                      iconAccessKey={visibleIconAccessKey}
+                      reuseSharedIcon={true}
                     />
                   {/if}
 
@@ -524,6 +543,9 @@
                       canSort={false}
                       onAddBookmark={onOpenCreateBookmark}
                       onEditBookmark={onEditBookmark}
+                      publicCategoryIds={publicCategoryIds}
+                      iconAccessKey={visibleIconAccessKey}
+                      reuseSharedIcon={true}
                     />
                   {/each}
                 </div>
@@ -538,6 +560,7 @@
           <CategorySection
             category={MOST_VISITED_CATEGORY}
             bookmarks={mostVisitedBookmarks}
+            {publicCategoryIds}
             showEmpty={false}
             cardWidth={settings?.card_size?.width ?? CARD_SIZE_DEFAULTS.width}
             cardHeight={settings?.card_size?.height ?? 60}
@@ -548,6 +571,8 @@
             cardIconShowTitle={settings?.card_icon_show_title ?? true}
             canSort={false}
             onEditBookmark={onEditBookmark}
+            iconAccessKey={visibleIconAccessKey}
+            reuseSharedIcon={true}
           />
         {/if}
         {#if categoryGroups.length > 0}
@@ -568,11 +593,17 @@
                 rootId={category.id}
                 title={category.title}
                 icon={category.icon}
+                icon_display={category.icon_display}
+                icon_revision={category.icon_revision}
+                icon_write_epoch={category.icon_write_epoch}
                 totalCount={getCategoryTreeBookmarkCount(category, allCategoryBookmarks)}
                 children={category.children.map((child) => ({
                   id: child.id,
                   title: child.title,
                   icon: child.icon,
+                  icon_display: child.icon_display,
+                  icon_revision: child.icon_revision,
+                  icon_write_epoch: child.icon_write_epoch,
                   count: allCategoryBookmarks.get(child.id)?.length ?? 0,
                 }))}
                 activeId={selectedCategory.id}
@@ -583,6 +614,8 @@
                 onAddBookmark={isAuthenticated && !homeSortMode && onOpenCreateBookmark ? () => onOpenCreateBookmark?.(selectedCategory.id) : undefined}
                 onRequestSort={isAuthenticated && !homeSortMode ? startHomeSort : undefined}
                 onSelect={(id) => handleScopeSelect(category.id, id)}
+                {publicCategoryIds}
+                iconAccessKey={visibleIconAccessKey}
               />
 
               <div
@@ -620,6 +653,9 @@
                       onMoveBookmark={handleMoveBookmark}
                       onSortDraft={handleHomeSortDraft}
                       onSortTransfer={handleHomeSortTransfer}
+                      publicCategoryIds={publicCategoryIds}
+                      iconAccessKey={visibleIconAccessKey}
+                      reuseSharedIcon={true}
                     />
                   {/each}
                 {:else}
@@ -653,6 +689,9 @@
                     onSaveSortSession={saveHomeSort}
                     onSortDraft={handleHomeSortDraft}
                     onSortTransfer={handleHomeSortTransfer}
+                    publicCategoryIds={publicCategoryIds}
+                    iconAccessKey={visibleIconAccessKey}
+                    reuseSharedIcon={true}
                   />
                 {/if}
               </div>
@@ -667,7 +706,7 @@
   </div>
 
   {#if homeSortMode || homeSortError}
-    <div class="home-sort-bar" class:error-state={Boolean(homeSortError)} role="toolbar" aria-label="跨分类排序操作">
+    <div class="home-sort-bar" use:observeSortToolbar={setSortToolbarInset} class:error-state={Boolean(homeSortError)} role="toolbar" aria-label="跨分类排序操作">
       {#if homeSortError}
         <span class="home-sort-message home-sort-error" role="alert">保存排序失败：{homeSortError}</span>
         <button type="button" class="home-sort-cancel" on:click={cancelHomeSort}>关闭</button>
@@ -692,7 +731,7 @@
   .home-shell {
     position: relative;
     min-height: 100dvh;
-    padding: 1.5rem calc(1.5rem + var(--content-margin-x, 0px)) var(--content-margin-bottom, 0%);
+    padding: 1.5rem calc(1.5rem + var(--content-margin-x, 0px)) calc(var(--content-margin-bottom, 0%) + var(--home-sort-bottom-inset, 0px));
     --home-text-color: var(--card-text-color, #0f172a);
     --home-muted-opacity: 0.72;
     --home-stat-bg: rgba(255, 255, 255, 0.5);
@@ -863,6 +902,11 @@
     gap: 1.2rem;
   }
 
+  /* scrollIntoView / keyboard navigation must also stop above the fixed bar. */
+  .home-shell :global(.bookmark-card-shell.sort-mode) {
+    scroll-margin-bottom: var(--home-sort-bottom-inset, 0px);
+  }
+
   .home-sort-bar {
     position: fixed;
     z-index: 20;
@@ -933,7 +977,7 @@
 
   @media (max-width: 799px) {
     .home-shell {
-      padding: 1rem 1rem var(--content-margin-bottom, 0%);
+      padding: 1rem 1rem calc(var(--content-margin-bottom, 0%) + var(--home-sort-bottom-inset, 0px));
     }
 
     .home-shell {

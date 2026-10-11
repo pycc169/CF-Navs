@@ -1,3 +1,5 @@
+import { readBoundedBody } from '../../shared/boundedBody'
+import type { IconCopyRequest, IconCopyResult, IconDescriptor } from '../../shared/iconLocalCopy'
 import {
   ErrCode,
   type AdminData,
@@ -59,7 +61,20 @@ export class ApiError extends Error {
   }
 }
 
-const AUTH_STORAGE_KEY = 'cf-navs.auth'
+export const AUTH_STORAGE_KEY = 'cf-navs.auth'
+const browserStorageSubscribers = new Set<(key: string | null) => void>()
+export function notifyBrowserStorageChange(key: string | null): void {
+  for (const listener of browserStorageSubscribers) listener(key)
+}
+export function subscribeBrowserStorageChanges(listener: (key: string | null) => void): () => void {
+  ensureAuthStorageListener()
+  browserStorageSubscribers.add(listener)
+  return () => browserStorageSubscribers.delete(listener)
+}
+export function refreshStoredAuthSession(): void {
+  cachedAuthSession = undefined
+  notifyBrowserStorageChange(AUTH_STORAGE_KEY)
+}
 const JSON_HEADERS = {
   accept: 'application/json',
   'content-type': 'application/json',
@@ -83,9 +98,8 @@ function ensureAuthStorageListener(): void {
   }
 
   window.addEventListener('storage', (event) => {
-    if (event.key === AUTH_STORAGE_KEY) {
-      cachedAuthSession = undefined
-    }
+    if (event.key === AUTH_STORAGE_KEY || event.key === null) cachedAuthSession = undefined
+    notifyBrowserStorageChange(event.key)
   })
   authStorageListenerAttached = true
 }
@@ -105,8 +119,10 @@ function buildUrl(path: string): string {
   return `${normalizedBase}${normalizedPath}`
 }
 
-async function parseResponseBody(response: Response): Promise<unknown> {
-  const text = await response.text()
+async function parseResponseBody(response: Response, maxBytes?: number): Promise<unknown> {
+  const bytes = maxBytes ? await readBoundedBody(response.body, maxBytes) : undefined
+  if (bytes === null) throw new ApiError('Response exceeds size limit', { status: response.status })
+  const text = bytes ? new TextDecoder().decode(bytes) : await response.text()
   if (!text) {
     return null
   }
@@ -169,6 +185,7 @@ export function getStoredAuthSession(): StoredAuthSession | null {
 
   ensureAuthStorageListener()
 
+  if (cachedAuthSession === null) return null
   if (cachedAuthSession !== undefined) {
     const session = normalizeStoredAuthSession(cachedAuthSession)
     if (!session) {
@@ -206,6 +223,7 @@ export function setStoredAuthSession(session: StoredAuthSession): void {
 
   ensureAuthStorageListener()
   localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session))
+  notifyBrowserStorageChange(AUTH_STORAGE_KEY)
 }
 
 export function clearStoredAuthSession(): void {
@@ -216,6 +234,7 @@ export function clearStoredAuthSession(): void {
 
   ensureAuthStorageListener()
   localStorage.removeItem(AUTH_STORAGE_KEY)
+  notifyBrowserStorageChange(AUTH_STORAGE_KEY)
 }
 
 export function getAuthToken(): string | null {
@@ -244,14 +263,16 @@ export function getErrorMessage(error: unknown): string {
 
 export interface RequestOptions extends RequestInit {
   auth?: boolean
+  maxResponseBytes?: number
   // 后台自动发起的请求应设为 true：用户没主动操作时，不该因为一次 401
   // 就清掉登录态，把手上未保存的表单一起弄丢。
   keepSessionOnUnauthorized?: boolean
 }
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { auth = false, keepSessionOnUnauthorized = false, headers: initHeaders, ...init } = options
+  const { auth = false, keepSessionOnUnauthorized = false, headers: initHeaders, maxResponseBytes, ...init } = options
   const headers = createHeaders(initHeaders)
+  const sessionToken = getAuthToken()
 
   if (auth) {
     maybeAttachAuth(headers)
@@ -278,11 +299,11 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     })
   }
 
-  const payload = await parseResponseBody(response)
+  const payload = await parseResponseBody(response, maxResponseBytes)
   const envelope = isApiResponse<T>(payload) ? payload : null
 
   if (!response.ok) {
-    if (response.status === 401 && !keepSessionOnUnauthorized) {
+    if (response.status === 401 && !keepSessionOnUnauthorized && sessionToken === getAuthToken()) {
       clearStoredAuthSession()
     }
 
@@ -302,7 +323,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   if (envelope.code !== ErrCode.OK) {
-    if (auth && envelope.code === ErrCode.UNAUTHORIZED && !keepSessionOnUnauthorized) {
+    if (auth && envelope.code === ErrCode.UNAUTHORIZED && !keepSessionOnUnauthorized && sessionToken === getAuthToken()) {
       clearStoredAuthSession()
     }
 
@@ -344,20 +365,21 @@ export const installApi = {
 
 export const publicApi = {
   getData: (auth = false) =>
-    request<PublicData>('/public/data', { auth, cache: 'no-store', headers: NO_CACHE_HEADERS }),
+    request<PublicData>('/public/data', { auth, cache: 'no-store', headers: NO_CACHE_HEADERS, keepSessionOnUnauthorized: true }),
   registerClick: (id: number) =>
     request<null>(`/public/bookmarks/${id}/click`, { method: 'POST', keepalive: true }),
 }
 
 export const adminApi = {
-  getData: () => request<AdminData>('/admin/data', { auth: true, cache: 'no-store', headers: NO_CACHE_HEADERS }),
+  getData: (options: Pick<RequestOptions, 'keepSessionOnUnauthorized'> = {}) =>
+    request<AdminData>('/admin/data', { auth: true, cache: 'no-store', headers: NO_CACHE_HEADERS, ...options }),
 }
 
 export const authApi = {
   login: (payload: LoginReq) => jsonRequest<LoginResp>('/login', 'POST', payload),
   changePassword: (payload: ChangePasswordReq) => jsonRequest<null>('/password', 'POST', payload, true),
   logout: () => jsonRequest<LogoutResp>('/logout', 'POST', undefined, true),
-  iconAccess: () => request<IconAccessResp>('/icon-access', { auth: true, cache: 'no-store' }),
+  iconAccess: () => request<IconAccessResp>('/icon-access', { auth: true, cache: 'no-store', keepSessionOnUnauthorized: true }),
   recover: (payload: RecoverReq, setupToken: string) =>
     jsonRequest<LoginResp>('/recover', 'POST', payload, false, { 'X-Setup-Token': setupToken }),
 }
@@ -375,7 +397,7 @@ export const bookmarksApi = {
   create: (payload: BookmarkUpsertReq) => jsonRequest<Bookmark>('/bookmarks', 'POST', payload, true),
   update: (id: number, payload: BookmarkUpsertReq) => jsonRequest<Bookmark>(`/bookmarks/${id}`, 'PUT', payload, true),
   refreshIconCache: (id: number) =>
-    jsonRequest<{ icon_blob: string | null }>(`/bookmarks/${id}/icon-cache/refresh`, 'POST', undefined, true),
+    jsonRequest<{ icon_blob: string | null; icon_descriptor?: IconDescriptor; icon_update?: 'updated' | 'unchanged' | 'cleared' | 'unavailable' }>(`/bookmarks/${id}/icon-cache/refresh`, 'POST', undefined, true),
   remove: (id: number) => request<null>(`/bookmarks/${id}`, { method: 'DELETE', auth: true }),
   batchDelete: (ids: number[]) => jsonRequest<BatchDeleteBookmarksResp>('/bookmarks/batch-delete', 'POST', { ids }, true),
   batchMove: (payload: BookmarkBatchMoveReq) => jsonRequest<BookmarkBatchMoveResp>('/bookmarks/batch-move', 'POST', payload, true),
@@ -410,7 +432,7 @@ export const settingsApi = {
 
 export const dataApi = {
   version: (auth = false) =>
-    request<DataVersionResp>('/data/version', { auth, cache: 'no-store', headers: NO_CACHE_HEADERS }),
+    request<DataVersionResp>('/data/version', { auth, cache: 'no-store', headers: NO_CACHE_HEADERS, keepSessionOnUnauthorized: true }),
   importAll: (payload: ImportReq) => jsonRequest<ImportResp>('/import', 'POST', payload, true),
 }
 
@@ -430,3 +452,9 @@ export const api = {
 }
 
 export default api
+
+/** Only this known protocol can materialize an authenticated no-store data response. */
+export function fetchIconCopy(payload: IconCopyRequest, signal?: AbortSignal): Promise<IconCopyResult> {
+  return request<IconCopyResult>('/icon-local-copy', { auth: true, method: 'POST', cache: 'no-store', signal,
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), maxResponseBytes: 768 * 1024 })
+}

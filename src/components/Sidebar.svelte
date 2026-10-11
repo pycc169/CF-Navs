@@ -14,6 +14,9 @@
     categoryId: number
     title: string
     icon: string | null
+    icon_display?: 'image' | 'text' | 'empty'
+    icon_revision?: string | null
+    icon_write_epoch?: number
     count?: number
     children?: NavigationItem[]
   }
@@ -24,6 +27,13 @@
   export let onNavigate: ((id: string | number) => void) | undefined = undefined
   export let onPersistentExpansionChange: ((expanded: boolean) => void) | undefined = undefined
   export let onTopNavHeightChange: ((height: number) => void) | undefined = undefined
+  export let onTopNavBottomChange: ((bottom: number) => void) | undefined = undefined
+  /**
+   * 对匿名访客可见的分类 id 集合。登录态下导航会列出私密分类，不在该集合里的分类图标
+   * 需带授权 key 才能取到真实图片（Issue #28）。
+   */
+  export let publicCategoryIds: Set<number> = new Set()
+  export let iconAccessKey = ''
 
   const MOBILE_WIDTH = 800
   const DRAG_THRESHOLD_PX = 6
@@ -190,6 +200,9 @@
       id: item.categoryId,
       title: item.title,
       icon: item.icon ?? null,
+      icon_display: item.icon_display,
+      icon_revision: item.icon_revision,
+      icon_write_epoch: item.icon_write_epoch,
     }
   }
 
@@ -315,7 +328,9 @@
   }
   function reportTopNavHeight(): void {
     if (!isTop || !navigationRoot) return
-    onTopNavHeightChange?.(navigationRoot.getBoundingClientRect().height)
+    const rect = navigationRoot.getBoundingClientRect()
+    onTopNavHeightChange?.(rect.height)
+    onTopNavBottomChange?.(rect.height > 0 ? Math.max(0, rect.bottom) : 0)
   }
 
   function scheduleOverflowUpdate(): void {
@@ -473,8 +488,8 @@
             aria-current={String(activeId) === String(item.id) ? 'location' : undefined}
             on:click={() => handleItemClick(item.id)}
           >
-            {#if item.icon}
-              <CategoryIcon category={getCategoryIconValue(item)} size="var(--category-root-icon-size, 22px)" className="top-category-icon" />
+            {#if item.icon || item.icon_display === 'image'}
+              <CategoryIcon category={getCategoryIconValue(item)} size="var(--category-root-icon-size, 22px)" className="top-category-icon" iconAccessKey={publicCategoryIds.has(Number(item.categoryId)) ? '' : iconAccessKey} />
             {/if}
             <span>{item.title}</span>
             {#if item.count != null}<small>{item.count}</small>{/if}
@@ -527,8 +542,8 @@
               on:click={() => handleItemClick(child.id)}
             >
               <span class="top-submenu-title">
-                {#if child.icon}
-                  <CategoryIcon category={getCategoryIconValue(child)} size="var(--category-child-icon-size, 22px)" className="top-submenu-icon" />
+                {#if child.icon || child.icon_display === 'image'}
+                  <CategoryIcon category={getCategoryIconValue(child)} size="var(--category-child-icon-size, 22px)" className="top-submenu-icon" iconAccessKey={publicCategoryIds.has(Number(child.categoryId)) ? '' : iconAccessKey} />
                 {/if}
                 <span>{child.title}</span>
               </span>
@@ -594,9 +609,9 @@
               aria-current={String(activeId) === String(item.id) ? 'location' : undefined}
               on:click={() => handleItemClick(item.id)}
             >
-              {#if item.icon}
+              {#if item.icon || item.icon_display === 'image'}
                 <span class="toc-icon-slot">
-                  <CategoryIcon category={getCategoryIconValue(item)} size="var(--category-root-icon-size, 26px)" className="toc-category-icon" />
+                  <CategoryIcon category={getCategoryIconValue(item)} size="var(--category-root-icon-size, 26px)" className="toc-category-icon" iconAccessKey={publicCategoryIds.has(Number(item.categoryId)) ? '' : iconAccessKey} />
                 </span>
               {:else}
                 <span class="toc-slip"></span>
@@ -628,8 +643,8 @@
                   on:click={() => handleItemClick(child.id)}
                 >
                   <span class="toc-child-title">
-                    {#if child.icon}
-                      <CategoryIcon category={getCategoryIconValue(child)} size="var(--category-child-icon-size, 21px)" className="toc-child-icon" />
+                    {#if child.icon || child.icon_display === 'image'}
+                      <CategoryIcon category={getCategoryIconValue(child)} size="var(--category-child-icon-size, 21px)" className="toc-child-icon" iconAccessKey={publicCategoryIds.has(Number(child.categoryId)) ? '' : iconAccessKey} />
                     {/if}
                     <span>{child.title}</span>
                   </span>

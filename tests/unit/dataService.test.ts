@@ -68,11 +68,14 @@ import {
   applyLocalCategorySort,
   applyLocalCategoryUpsert,
   applyPublicData,
+  applyLoggedInData,
   configureDataService,
   getCurrentDataVersion,
   isLoggedIn,
   refreshLoggedInData,
+  readAdminDataForEdit,
   refreshPublicData,
+  refreshVisibleData,
 } from '../../src/lib/dataService'
 import { adminStore, authStore, configStore, publicStore } from '../../src/lib/stores'
 
@@ -400,5 +403,328 @@ describe('dataService.isLoggedIn', () => {
     expect(isLoggedIn()).toBe(false)
     authStore.setSession(session)
     expect(isLoggedIn()).toBe(true)
+  })
+})
+
+describe('dataService.refreshVisibleData', () => {
+  it('refreshes logged-in data when a session exists, keeping a private bookmark in the public store', async () => {
+    const privateBookmark: Bookmark = { ...bookmark, id: 12, title: 'Secret', is_private: 1 }
+    authStore.setSession(session)
+    api.data.version.mockResolvedValue({ version: 'v2', site_title: 'CF-Navs', public_mode: true })
+    api.admin.getData.mockResolvedValue({ ...makeAdminData('v2'), bookmarks: [bookmark, privateBookmark] })
+
+    await refreshVisibleData()
+
+    expect(api.public.getData).not.toHaveBeenCalled()
+    expect(api.admin.getData).toHaveBeenCalledOnce()
+    expect(get(publicStore).data?.bookmarks.map((item) => item.id)).toEqual([10, 12])
+  })
+
+  it('falls back to the public refresh when logged out', async () => {
+    publicCache.readCachedPublicDataEntry.mockResolvedValue(undefined)
+    api.data.version.mockResolvedValue({ version: 'v1', site_title: 'CF-Navs', public_mode: true })
+    api.public.getData.mockResolvedValue(makePublicData('v1'))
+
+    await refreshVisibleData()
+
+    expect(api.public.getData).toHaveBeenCalledWith(false)
+    expect(api.admin.getData).not.toHaveBeenCalled()
+  })
+
+  it('clears the expired session, private stores and refreshes public data when the logged-in refresh is unauthorized', async () => {
+    authStore.setSession(session)
+    adminStore.replaceData(makeAdminData())
+    publicStore.setData({ ...makePublicData(), bookmarks: [makePublicBookmark({ ...bookmark, is_private: 1 })] })
+    configStore.setData({ site_title: 'CF-Navs', public_mode: true })
+    publicCache.readCachedPublicDataEntry.mockResolvedValue(undefined)
+    api.admin.getData.mockRejectedValue(new ApiError('unauthorized', { status: 401, code: ErrCode.UNAUTHORIZED }))
+    api.public.getData.mockResolvedValue(makePublicData('v1'))
+
+    await refreshVisibleData()
+
+    expect(get(authStore).session).toBeNull()
+    expect(get(adminStore).data.settings).toBeNull()
+    expect(adminCache.clearCachedAdminData).toHaveBeenCalledOnce()
+    expect(api.public.getData).toHaveBeenCalledWith(false)
+  })
+
+  it('drops the private home data before an unauthorized public fallback that itself fails', async () => {
+    authStore.setSession(session)
+    adminStore.replaceData(makeAdminData())
+    publicStore.setData({ ...makePublicData(), bookmarks: [makePublicBookmark({ ...bookmark, is_private: 1 })] })
+    configStore.setData({ site_title: 'CF-Navs', public_mode: true })
+    adminCache.readCachedAdminDataEntry.mockResolvedValue(undefined)
+    publicCache.readCachedPublicDataEntry.mockResolvedValue(undefined)
+    api.admin.getData.mockRejectedValue(new ApiError('unauthorized', { status: 401, code: ErrCode.UNAUTHORIZED }))
+    api.public.getData.mockRejectedValue(new ApiError('backend down', { status: 500, code: ErrCode.SERVER_ERROR }))
+
+    await refreshVisibleData()
+
+    expect(get(authStore).session).toBeNull()
+    expect(get(publicStore).data).toBeNull()
+  })
+
+  it('reports non-auth failures instead of swallowing them', async () => {
+    authStore.setSession(session)
+    adminCache.readCachedAdminDataEntry.mockResolvedValue(undefined)
+    api.admin.getData.mockRejectedValue(new ApiError('backend down', { status: 500, code: ErrCode.SERVER_ERROR }))
+
+    await expect(refreshVisibleData()).resolves.toBeUndefined()
+    expect(api.public.getData).not.toHaveBeenCalled()
+    expect(onRootError).toHaveBeenCalledOnce()
+    expect(onRootError.mock.calls[0][0]).toContain('backend down')
+  })
+})
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+describe('dataService refresh ownership', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+    adminCache.readCachedAdminDataEntry.mockResolvedValue(null)
+    publicCache.readCachedPublicDataEntry.mockResolvedValue(null)
+    api.public.getData.mockResolvedValue(makePublicData('public'))
+    api.admin.getData.mockResolvedValue(makeAdminData('admin'))
+  })
+
+  it('discards an authenticated response delivered after logout', async () => {
+    authStore.setSession(session)
+    const old = deferred<AdminData>()
+    api.admin.getData.mockReturnValueOnce(old.promise)
+    const refresh = refreshVisibleData()
+    await vi.waitFor(() => expect(api.admin.getData).toHaveBeenCalledOnce())
+    authStore.setSession(null)
+    await refreshVisibleData()
+    old.resolve(makeAdminData('old'))
+    await refresh
+    expect(get(publicStore).data?.bookmarks).toEqual([])
+    expect(get(adminStore).data.settings).toBeNull()
+    expect(getCurrentDataVersion()).toBe('public')
+    expect(adminCache.writeCachedAdminData).not.toHaveBeenCalled()
+  })
+
+  it('discards an anonymous response delivered after login', async () => {
+    const old = deferred<PublicData>()
+    api.public.getData.mockReturnValueOnce(old.promise)
+    const refresh = refreshVisibleData()
+    await vi.waitFor(() => expect(api.public.getData).toHaveBeenCalledOnce())
+    authStore.setSession(session)
+    await refreshVisibleData()
+    old.resolve(makePublicData('old'))
+    await refresh
+    expect(get(publicStore).data?.bookmarks).toHaveLength(1)
+    expect(getCurrentDataVersion()).toBe('admin')
+    expect(publicCache.writeCachedPublicData).not.toHaveBeenCalled()
+  })
+
+  it.each(['401', 'network'])('ignores an old %s error after a replacement login', async (kind) => {
+    authStore.setSession(session)
+    const old = deferred<AdminData>()
+    api.admin.getData.mockReturnValueOnce(old.promise)
+    const refresh = refreshVisibleData()
+    await vi.waitFor(() => expect(api.admin.getData).toHaveBeenCalledOnce())
+    const replacement = { ...session, token: 'replacement-session' }
+    authStore.setSession(replacement)
+    await refreshVisibleData()
+    old.reject(kind === '401' ? new ApiError('expired', { status: 401, code: ErrCode.UNAUTHORIZED }) : new Error('offline'))
+    await refresh
+    expect(get(authStore).session).toEqual(replacement)
+    expect(get(publicStore).data?.bookmarks).toHaveLength(1)
+    expect(adminCache.clearCachedAdminData).not.toHaveBeenCalled()
+    expect(onRootError).not.toHaveBeenCalled()
+  })
+
+  it.each(['public', 'admin'])('discards a delayed %s snapshot after a session change', async (kind) => {
+    if (kind === 'admin') authStore.setSession(session)
+    const old = deferred<unknown>()
+    const cache = kind === 'admin' ? adminCache.readCachedAdminDataEntry : publicCache.readCachedPublicDataEntry
+    cache.mockReturnValueOnce(old.promise)
+    const refresh = refreshVisibleData()
+    authStore.setSession(kind === 'admin' ? null : session)
+    if (kind === 'public') applyLoggedInData(makeAdminData('new'))
+    else applyPublicData(makePublicData('new'))
+    old.resolve({ data: kind === 'admin' ? makeAdminData() : makePublicData(), version: 'old' })
+    await refresh
+    expect(getCurrentDataVersion()).toBe('new')
+    expect(get(publicStore).data?.bookmarks).toHaveLength(kind === 'admin' ? 0 : 1)
+    expect(api.data.version).not.toHaveBeenCalled()
+    expect(api.admin.getData).not.toHaveBeenCalled()
+    expect(api.public.getData).not.toHaveBeenCalled()
+  })
+
+  it('does not let an old version response change the current configuration', async () => {
+    publicCache.readCachedPublicDataEntry.mockResolvedValueOnce({ data: makePublicData(), version: 'old' })
+    const old = deferred<{ version: string; site_title: string; public_mode: boolean }>()
+    api.data.version.mockReturnValueOnce(old.promise)
+    const refresh = refreshVisibleData()
+    await vi.waitFor(() => expect(api.data.version).toHaveBeenCalledOnce())
+    authStore.setSession(session)
+    await refreshVisibleData()
+    old.resolve({ version: 'obsolete', site_title: 'Obsolete', public_mode: false })
+    await refresh
+    expect(getCurrentDataVersion()).toBe('admin')
+    expect(get(configStore).data).toEqual({ site_title: settings.site_title, public_mode: true })
+    expect(api.public.getData).not.toHaveBeenCalled()
+  })
+
+  it('keeps the latest refresh when same-session responses arrive out of order', async () => {
+    authStore.setSession(session)
+    const old = deferred<AdminData>()
+    api.admin.getData.mockReturnValueOnce(old.promise)
+    const refresh = refreshLoggedInData(true)
+    await refreshLoggedInData(true)
+    old.resolve({ ...makeAdminData('obsolete'), bookmarks: [] })
+    await refresh
+    expect(getCurrentDataVersion()).toBe('admin')
+    expect(get(publicStore).data?.bookmarks).toHaveLength(1)
+    expect(adminCache.writeCachedAdminData).toHaveBeenCalledOnce()
+  })
+
+  it('clears private view immediately even when the logout public refresh fails', async () => {
+    authStore.setSession(session)
+    applyLoggedInData(makeAdminData())
+    authStore.setSession(null)
+    expect(get(publicStore).data).toBeNull()
+    expect(get(adminStore).data.settings).toBeNull()
+    api.public.getData.mockRejectedValueOnce(new Error('offline'))
+    await refreshVisibleData()
+    expect(get(publicStore).data).toBeNull()
+  })
+
+  it('does not launch a public fallback if login changes during unauthorized cache cleanup', async () => {
+    authStore.setSession(session)
+    const clearing = deferred<void>()
+    adminCache.clearCachedAdminData.mockReturnValueOnce(clearing.promise)
+    api.admin.getData.mockRejectedValueOnce(new ApiError('expired', { status: 401, code: ErrCode.UNAUTHORIZED }))
+    const refresh = refreshVisibleData()
+    await vi.waitFor(() => expect(adminCache.clearCachedAdminData).toHaveBeenCalledOnce())
+    authStore.setSession({ ...session, token: 'new-session' })
+    await refreshVisibleData()
+    clearing.resolve()
+    await refresh
+    expect(api.public.getData).not.toHaveBeenCalled()
+    expect(get(publicStore).data?.bookmarks).toHaveLength(1)
+  })
+
+  it('cancels old progressive batches when login replaces the visible data', async () => {
+    vi.useFakeTimers()
+    try {
+      const data = makePublicData('old')
+      data.bookmarks = Array.from({ length: 150 }, (_, index) => makePublicBookmark({ ...bookmark, id: index + 1 }))
+      applyPublicData(data, 'old', true)
+      expect(get(publicStore).data?.bookmarks).toHaveLength(60)
+      authStore.setSession(session)
+      applyLoggedInData(makeAdminData('new'))
+      await vi.runAllTimersAsync()
+      expect(get(publicStore).data?.bookmarks).toHaveLength(1)
+      expect(getCurrentDataVersion()).toBe('new')
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('dataService authoritative edit reads', () => {
+  it('restores source fields without replacing projected view stores or snapshots', async () => {
+    authStore.setSession(session)
+    const projected = makeAdminData('v1')
+    projected.bookmarks[0] = { ...bookmark, icon: null, icon_blob: null, icon_display: 'image' }
+    applyLoggedInData(projected)
+    const view = get(publicStore).data, admin = get(adminStore).data
+    const raw = makeAdminData('v1')
+    raw.bookmarks = [{ ...bookmark, icon: 'data:image/svg+xml;base64,PHN2Zy8+', icon_source: 'custom' }]
+    raw.categories = [{ ...category, icon: 'data:image/svg+xml;base64,PHN2Zy8+' }]
+    api.admin.getData.mockResolvedValueOnce(raw)
+    expect(await readAdminDataForEdit()).toBe(raw)
+    expect(get(publicStore).data).toBe(view)
+    expect(get(adminStore).data).toBe(admin)
+    expect(adminCache.readCachedAdminDataEntry).not.toHaveBeenCalled()
+    expect(adminCache.writeCachedAdminData).not.toHaveBeenCalled()
+  })
+  it('does not read private edit data while logged out', async () => {
+    expect(await readAdminDataForEdit()).toBeNull()
+    expect(api.admin.getData).not.toHaveBeenCalled()
+  })
+  it('discards edit data after an identity change', async () => {
+    authStore.setSession(session)
+    let resolve!: (data: AdminData) => void
+    api.admin.getData.mockReturnValueOnce(new Promise<AdminData>(done => { resolve = done }))
+    const pending = readAdminDataForEdit()
+    authStore.setSession({ ...session, token: 'new-session' })
+    resolve(makeAdminData())
+    expect(await pending).toBeNull()
+  })
+  it('does not surface an old 401 into a new edit session', async () => {
+    authStore.setSession(session)
+    let reject!: (error: Error) => void
+    api.admin.getData.mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail }))
+    const pending = readAdminDataForEdit()
+    authStore.setSession({ ...session, token: 'new-session' })
+    reject(Object.assign(new Error('old 401'), { status: 401 }))
+    expect(await pending).toBeNull()
+    expect(get(authStore).session?.token).toBe('new-session')
+  })
+  it('does not substitute a lossy snapshot when the authoritative read fails', async () => {
+    authStore.setSession(session)
+    applyLoggedInData(makeAdminData())
+    api.admin.getData.mockRejectedValueOnce(new Error('offline'))
+    await expect(readAdminDataForEdit()).rejects.toThrow('offline')
+    expect(adminCache.readCachedAdminDataEntry).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('warm public snapshot rendering', () => {
+  function largeData(version: string, count = 150): PublicData {
+    const data = makePublicData(version)
+    data.bookmarks = Array.from({ length: count }, (_, index) => makePublicBookmark({ ...bookmark, id: index + 1, title: 'Synthetic ' + index }))
+    return data
+  }
+  it('does not retract an already visible full list into a first batch on refresh', async () => {
+    vi.useFakeTimers()
+    const lengths: number[] = []
+    let stop = () => {}
+    try {
+      applyPublicData(largeData('before'))
+      stop = publicStore.subscribe(state => { if (state.data) lengths.push(state.data.bookmarks.length) })
+      const next = largeData('after'); next.bookmarks[149].title = 'Changed synthetic title'
+      applyPublicData(next, 'after', true)
+      expect(lengths).toEqual([150, 150])
+      expect(get(publicStore).data?.bookmarks[149].title).toBe('Changed synthetic title')
+      await vi.runAllTimersAsync()
+      expect(lengths).toEqual([150, 150])
+    } finally { stop(); vi.useRealTimers() }
+  })
+  it('keeps restored cached data complete while applying the authoritative response', async () => {
+    vi.useFakeTimers()
+    const lengths: number[] = []
+    const stop = publicStore.subscribe(state => { if (state.data) lengths.push(state.data.bookmarks.length) })
+    try {
+      publicCache.readCachedPublicDataEntry.mockResolvedValueOnce({data:largeData('before'),version:'before'})
+      api.data.version.mockResolvedValueOnce({version:'after',site_title:'Synthetic',public_mode:true})
+      const next=largeData('after');next.bookmarks[149].title='Refreshed'
+      api.public.getData.mockResolvedValueOnce(next)
+      await refreshPublicData(true)
+      expect(lengths).toEqual([150,150])
+      expect(dataHooks.onLocalSnapshotRestored).toHaveBeenCalledOnce()
+      expect(publicCache.writeCachedPublicData).toHaveBeenCalledOnce()
+      expect(get(publicStore).data?.bookmarks[149].title).toBe('Refreshed')
+    } finally { stop(); await vi.runAllTimersAsync(); vi.useRealTimers() }
+  })
+  it('applies removal immediately and invalidates previous first-load batches', async () => {
+    vi.useFakeTimers()
+    try {
+      applyPublicData(largeData('first'), 'first', true)
+      expect(get(publicStore).data?.bookmarks).toHaveLength(60)
+      applyPublicData(largeData('replacement',149), 'replacement', true)
+      expect(get(publicStore).data?.bookmarks).toHaveLength(149)
+      await vi.runAllTimersAsync()
+      expect(get(publicStore).data?.bookmarks).toHaveLength(149)
+      expect(get(publicStore).data?.bookmarks.some(item=>item.id===150)).toBe(false)
+      expect(getCurrentDataVersion()).toBe('replacement')
+    } finally { vi.useRealTimers() }
   })
 })
