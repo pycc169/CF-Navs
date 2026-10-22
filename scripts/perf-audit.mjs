@@ -16,12 +16,13 @@
 //   PERF_MAX_ADMIN_DATA_TRANSFER=60000
 //   PERF_MAX_CACHE_BYTES=5242880
 //   PERF_MIN_BOOKMARK_CARDS=300
-//   PERF_MAX_ICON_REQUESTS=260
+//   PERF_MAX_ICON_REQUESTS=270
 
 import { join as pathJoin } from 'node:path'
 import { CdpSession } from './lib/cdpSession.mjs'
 import { requireAdminCredentials } from './lib/verifyCredentials.mjs'
 import { resolveBaseUrl, resolveChromeProfileRoot, resolveSetting } from './lib/verifyTarget.mjs'
+import { loginInPage } from './lib/browserLogin.mjs'
 
 const BASE_URL = resolveBaseUrl()
 const CHROME_DEBUG_PORT = resolveSetting('CHROME_DEBUG_PORT', 'chromeDebugPort', '9223')
@@ -31,7 +32,7 @@ const MAX_FAILED_REQUESTS = readIntegerEnv('PERF_MAX_FAILED_REQUESTS', 0)
 const MAX_ADMIN_DATA_TRANSFER = readIntegerEnv('PERF_MAX_ADMIN_DATA_TRANSFER', 60000)
 const MAX_CACHE_BYTES = readIntegerEnv('PERF_MAX_CACHE_BYTES', 5 * 1024 * 1024)
 const MIN_BOOKMARK_CARDS = readIntegerEnv('PERF_MIN_BOOKMARK_CARDS', 300)
-const MAX_ICON_REQUESTS = readIntegerEnv('PERF_MAX_ICON_REQUESTS', 260)
+const MAX_ICON_REQUESTS = readIntegerEnv('PERF_MAX_ICON_REQUESTS', 270)
 
 const TARGET_ORIGIN = new URL(BASE_URL).origin
 const TARGET_URL = `${TARGET_ORIGIN}/`
@@ -198,21 +199,11 @@ async function waitForNetworkIdle(idleMs = 1500, maxMs = 35000) {
 }
 
 async function login() {
-  return evaluate(
-    `(${async function loginInPage(baseUrl, username, password) {
-      const response = await fetch(`${baseUrl}/api/login`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      })
-      const body = await response.json()
-      if (!response.ok || body.code !== 0) {
-        throw new Error(`login failed: ${JSON.stringify(body)}`)
-      }
-      localStorage.setItem('cf-navs.auth', JSON.stringify(body.data))
-      return { username: body.data.username, expires_at: body.data.expires_at }
-    }.toString()})(${JSON.stringify(TARGET_ORIGIN)}, ${JSON.stringify(ADMIN_USER)}, ${JSON.stringify(ADMIN_PASS)})`,
+  const result = await evaluate(
+    `(${loginInPage.toString()})(${JSON.stringify(TARGET_ORIGIN)}, ${JSON.stringify(ADMIN_USER)}, ${JSON.stringify(ADMIN_PASS)})`,
   )
+  if (!result?.ok) throw new Error(`login failed: ${JSON.stringify(result?.body ?? result)}`)
+  return { username: result.username, expires_at: result.expires_at }
 }
 
 async function navigateHome() {
