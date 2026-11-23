@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { get } from 'svelte/store'
 import type {
@@ -21,7 +22,7 @@ const { api, publicCache, adminCache, dataHooks } = vi.hoisted(() => ({
     data: { version: vi.fn() },
     public: { getData: vi.fn(), registerClick: vi.fn() },
     admin: { getData: vi.fn() },
-    bookmarks: { refreshIconCache: vi.fn() },
+    bookmarks: { refreshIconCache: vi.fn(), getForEdit: vi.fn() },
   },
   publicCache: {
     readCachedPublicDataEntry: vi.fn(),
@@ -79,6 +80,7 @@ import {
   confirmLoggedInDataAfterLocalMutation,
   recordMutationDataVersion,
   readAdminDataForEdit,
+  readBookmarkForEdit,
   recordBookmarkClick,
   refreshBookmarkIconCacheInBackground,
   refreshPublicData,
@@ -293,6 +295,11 @@ describe('dataService.refreshPublicData', () => {
 })
 
 describe('dataService.recordBookmarkClick', () => {
+  beforeEach(() => {
+    // 真实 registerClick 恒返回 Promise；裸 mock 返回 undefined 会让调用点的 .catch 抛错。
+    api.public.registerClick.mockResolvedValue(null)
+  })
+
   it('persists the optimistic click into the same-version snapshot so a refresh keeps it (anonymous)', async () => {
     const seeded: PublicData = { ...makePublicData('v1'), bookmarks: [{ ...makePublicBookmark(bookmark), click_count: 0 }] }
     applyPublicData(seeded, 'v1')
@@ -315,6 +322,24 @@ describe('dataService.recordBookmarkClick', () => {
 
     expect(get(publicStore).data?.bookmarks[0].click_count).toBe(1)
     expect(api.public.getData).not.toHaveBeenCalled()
+  })
+
+  it('swallows registerClick failures instead of leaking an unhandled rejection (PR #26)', async () => {
+    applyPublicData({ ...makePublicData('v1'), bookmarks: [{ ...makePublicBookmark(bookmark), click_count: 0 }] }, 'v1')
+    api.public.registerClick.mockRejectedValueOnce(new Error('network down'))
+
+    // 行为契约：登记失败不许同步抛错、不许影响本地乐观计数。
+    expect(() => recordBookmarkClick(bookmark.id)).not.toThrow()
+    expect(api.public.registerClick).toHaveBeenCalledWith(bookmark.id)
+    expect(get(publicStore).data?.bookmarks[0].click_count).toBe(1)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // 接线断言：rejection 是否被吞只能发生在调用点接了 .catch 上。
+    // 本文件跑在 vmForks 的 jsdom 环境，vm 内的 unhandled rejection 传不到
+    // 宿主 process，行为层面测不出来，故按仓库既有的接线断言先例对源码形状兜底：
+    // 撤掉 .catch 本用例必红（已实测对照）。
+    const source = readFileSync('src/lib/dataService.ts', 'utf8')
+    expect(source).toMatch(/void api\.public\.registerClick\(bookmarkId\)\.catch\(\(\) => undefined\)/)
   })
 
   it('increments and persists the admin snapshot when logged in', () => {
@@ -780,6 +805,53 @@ describe('dataService refresh ownership', () => {
 })
 
 describe('dataService authoritative edit reads', () => {
+  it('reads only the requested bookmark without replacing projected stores or snapshots', async () => {
+    authStore.setSession(session)
+    const projected = makeAdminData('v1')
+    projected.bookmarks[0] = { ...bookmark, icon: null, icon_blob: null, icon_display: 'image' }
+    applyLoggedInData(projected)
+    const view = get(publicStore).data, admin = get(adminStore).data
+    const raw = { ...bookmark, icon: 'data:image/svg+xml;base64,PHN2Zy8+', icon_source: 'custom' }
+    api.bookmarks.getForEdit.mockResolvedValueOnce(raw)
+    const signal = new AbortController().signal
+    expect(await readBookmarkForEdit(bookmark.id, signal)).toBe(raw)
+    expect(api.bookmarks.getForEdit).toHaveBeenCalledWith(bookmark.id, signal)
+    expect(api.admin.getData).not.toHaveBeenCalled()
+    expect(get(publicStore).data).toBe(view)
+    expect(get(adminStore).data).toBe(admin)
+    expect(adminCache.readCachedAdminDataEntry).not.toHaveBeenCalled()
+    expect(adminCache.writeCachedAdminData).not.toHaveBeenCalled()
+  })
+  it('does not request a bookmark source while logged out', async () => {
+    expect(await readBookmarkForEdit(bookmark.id)).toBeNull()
+    expect(api.bookmarks.getForEdit).not.toHaveBeenCalled()
+  })
+  it('drops a single-bookmark response when the session changes', async () => {
+    authStore.setSession(session)
+    let resolve!: (data: Bookmark) => void
+    api.bookmarks.getForEdit.mockReturnValueOnce(new Promise<Bookmark>(done => { resolve = done }))
+    const pending = readBookmarkForEdit(bookmark.id)
+    authStore.setSession({ ...session, token: 'new-session' })
+    resolve(bookmark)
+    expect(await pending).toBeNull()
+  })
+  it('drops an old failed single-bookmark read without clearing a newer session', async () => {
+    authStore.setSession(session)
+    let reject!: (error: Error) => void
+    api.bookmarks.getForEdit.mockReturnValueOnce(new Promise((_resolve, fail) => { reject = fail }))
+    const pending = readBookmarkForEdit(bookmark.id)
+    authStore.setSession({ ...session, token: 'new-session' })
+    reject(Object.assign(new Error('old 401'), { status: 401 }))
+    expect(await pending).toBeNull()
+    expect(get(authStore).session?.token).toBe('new-session')
+  })
+  it('does not use a projected snapshot when a single-bookmark read fails', async () => {
+    authStore.setSession(session)
+    applyLoggedInData(makeAdminData())
+    api.bookmarks.getForEdit.mockRejectedValueOnce(new Error('offline'))
+    await expect(readBookmarkForEdit(bookmark.id)).rejects.toThrow('offline')
+    expect(adminCache.readCachedAdminDataEntry).not.toHaveBeenCalled()
+  })
   it('restores source fields without replacing projected view stores or snapshots', async () => {
     authStore.setSession(session)
     const projected = makeAdminData('v1')

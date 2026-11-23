@@ -116,6 +116,8 @@
 
 全部需要登录。
 
+Chrome/Edge 扩展通过 `OPTIONS /api/categories` 预检后读取此列表；CORS 只影响扩展跨源调用能力，GET 仍必须携带有效 Bearer Session Token，未认证响应为 401。
+
 | 方法 | 路径 | 返回 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/api/admin/data` | `AdminData` | 后台初始化聚合数据，一次返回分类、书签和完整 `Settings`，用于替代进入后台时分别请求公开数据和设置 |
@@ -148,6 +150,7 @@
 | 方法 | 路径 | 请求 | 返回 |
 | --- | --- | --- | --- |
 | GET | `/api/bookmarks` | 无 | `Bookmark[]` |
+| GET | `/api/bookmarks/:id` | 无 | `BookmarkEditData` |
 | POST | `/api/bookmarks` | `BookmarkUpsertReq` | `Bookmark` |
 | PUT | `/api/bookmarks/:id` | `BookmarkUpsertReq` | `Bookmark` |
 | DELETE | `/api/bookmarks/:id` | 无 | `null` |
@@ -158,7 +161,11 @@
 | POST | `/api/bookmarks/:id/icon-cache/refresh` | 无 | `{ icon_blob, icon_descriptor, icon_update }` |
 | POST | `/api/bookmarks/check-health` | `{ ids: number[] }` | `{ id, status, ok }[]` |
 
-`POST /api/bookmarks/:id/icon-cache/refresh` 在当前源/写入代次下显式刷新成功图标，支持 data URI 及 HTTP(S)（含 Iconify），失败不覆盖最近成功正文。响应保留 `icon_blob`，并附 `icon_descriptor` 与 `icon_update`（updated/unchanged/cleared/unavailable）；并发保存获胜时返回重新读取的当前结果，不能返回旧源抓取结果。相同字节保持内容版本不变。响应为 `private, no-store`。浏览器能否保存仍须通过可信设备、当前会话与统一存储策略，不能因接口返回了 data URI 自动认领权限。
+`GET /api/bookmarks/:id` 通过一次按主键的查询返回原始编辑字段：`id/category_id/title/url/icon/icon_source/icon_background_color/description/description_mode/open_method/is_private`。原始 `icon`（含 data URI）必须完整保留；不返回 `icon_blob`、设置、其它书签或分类，不修改数据与图标版本。响应为 `private, no-store`；无登录态返回 HTTP 401，无效编号返回 `code=1002`，不存在返回 `code=1003`。编辑数据不写入显示 store 或有损快照，读取失败时不可用显示快照替代保存基线。该接口与 `/api/admin/data` 提供 `Server-Timing` 的 `auth/db/serialize` 毫秒指标，分别记录会话校验、数据访问（含往返）和 JSON 响应生成；它们不包含客户端网络和正文下载时间，也不暴露 SQL、账号或源字段。
+
+`PUT /api/bookmarks/:id` 在 `category_id` 实际改变时，将该书签的 `sort` 设置为目标分类当前最大值加一，空分类从 `0` 开始；分类不变时保留原 `sort`。分类与排序在同一条数据库更新中写入，并与 `data_version` 同事务提交。客户端无需提交排序值，成功响应中的 `Bookmark.sort` 是保存后的权威值；不存在的书签或目标分类不会产生部分更新，也不会提升数据版本。该规则用于普通分类列表，首页“经常访问”和一级分类“常用”聚合仍按访问频次排列。
+
+`POST /api/bookmarks/:id/icon-cache/refresh` 在当前源/写入代次下显式刷新成功图标，支持 data URI 及 HTTP(S)（含 Iconify），失败不覆盖最近成功正文。响应保留 `icon_blob`，并附 `icon_descriptor` 与 `icon_update`（updated/unchanged/cleared/unavailable）；并发保存获胜时返回重新读取的当前结果，不能返回旧源抓取结果。相同字节保持内容版本不变。响应为 `private, no-store`。浏览器能否保存仍须通过可信设备、当前会话与统一存储策略，不能因接口返回了 data URI 自动认领权限。打开编辑表单不再主动调用刷新，保存后的后台补图与其它显式刷新入口保持。
 
 `GET /api/bookmarks` 的列表口径与聚合一致：`icon_blob` 恒为 `null`，以 `icon_cached` 表示 D1 中是否已有图标正文，不再把每个书签的 base64 正文读进 Worker 再下发（当前前端不调用该接口；需要正文的合并导入在服务端内部单独读取）。批量删除按 D1 参数上限分块执行 `DELETE ... WHERE id IN (...)`。批量删除请求最多包含 500 个正整数 ID；排序请求的 `ids` 最多 5000 个；服务端会去重并忽略已不存在的记录。书签 `url` 必须是 `http(s)` 地址，其它协议返回 `code=1002`；后台表单会先把缺协议的写法（`example.com`）补成 `https://` 再提交，补不了的原样送出由服务端拒绝。书签写入可携带 `description_mode: "always" | "hover" | "hidden" | null`；更新时省略该字段会保留原覆盖值，显式 `null` 会恢复跟随全局设置。
 `POST /api/bookmarks/batch-move` 用于管理员批量移动书签，不改变 `/api/bookmarks/reorganize` 的完整排序契约。请求为 `{ ids: number[], category_id: number, position: 'end' | 'start', expected: { id: number, category_id: number, sort: number }[] }`；`ids` 最多 500 个且不得重复，`expected` 必须与 `ids` 一一对应，用于拒绝过期集合。`position='end'` 追加到目标分类现有书签末尾，`position='start'` 插入目标分类开头；默认由前端传 `end`。服务端必须在一次原子操作中更新选中书签的 `category_id` 和受影响书签的全局 `sort`，校验失败不得部分成功。选中集合、快照、目标分类或权限不一致返回 `code=1006`（`ErrCode.CONFLICT`）；其它服务端故障返回 `code=1500`。成功返回 `{ moved, category_id, position }`。
@@ -330,9 +337,9 @@ HTTP(S) 图标抓取成功后，代理会直接返回图片字节并写入 Cloud
 
 | 方法 | 路径 | 请求 | 返回 |
 | --- | --- | --- | --- |
-| POST | `/api/browser-sync/bookmarks` | `{ bookmarks: { title: string, url: string }[] }`，最多 100 条 | `{ category_id, category_title, created, skipped }` |
+| POST | `/api/browser-sync/bookmarks` | `{ bookmarks: { title: string, url: string }[], category_id?: number }`，最多 100 条 | `{ category_id, category_title, created, skipped }` |
 
-服务端只接收 `http://` 和 `https://` 书签；重复 URL、空标题、非法 URL 或无效记录会计入 `skipped`。同步创建的书签默认写入 `https://favicon.im/<hostname>?larger=true`，`icon_source` 为 `favicon_im`，不在同步请求期间执行外部页面抓取。同步开关关闭时返回冲突错误，不会写入数据。浏览器收藏夹文件夹不会作为导航分类处理，所有记录固定写入“浏览器新增收藏”。
+服务端只接收 `http://` 和 `https://` 书签；目标分类内的重复 URL、空标题、非法 URL 或无效记录会计入 `skipped`。传入 `category_id` 时必须指向现存分类，否则返回 `1003`，不写入任何书签，也不回退到默认分类；省略时保持旧客户端行为，写入“浏览器新增收藏”。同步创建的书签默认写入 `https://favicon.im/<hostname>?larger=true`，`icon_source` 为 `favicon_im`，不在同步请求期间执行外部页面抓取。同步开关关闭时返回冲突错误，不会写入数据。浏览器收藏夹文件夹不会作为导航分类处理，扩展在每次同步确认前由用户选择分类。
 
 ## 导入接口
 

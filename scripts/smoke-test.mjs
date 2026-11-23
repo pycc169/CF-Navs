@@ -167,6 +167,51 @@ async function main() {
     check('排序后 bm2 在前', list[0]?.id === bm2.id, `first=${list[0]?.id}`)
   }
 
+  section('编辑改分类的末尾位置与普通编辑保序')
+  {
+    const editBody = { title: 'GitHub(改)', url: 'https://github.com', open_method: 1 }
+    const emptyMove = await call(`/api/bookmarks/${bm1.id}`, {
+      method: 'PUT', token, body: { ...editBody, category_id: catB.id },
+    })
+    check('编辑移入空分类 code=0', emptyMove.json?.code === 0)
+    check('空分类从 sort=0 开始', emptyMove.json?.data?.category_id === catB.id && emptyMove.json?.data?.sort === 0)
+
+    const restore = await call(`/api/bookmarks/${bm1.id}`, {
+      method: 'PUT', token, body: { ...editBody, category_id: catA.id },
+    })
+    check('编辑移回源分类追加到末尾', restore.json?.code === 0 && restore.json?.data?.category_id === catA.id && restore.json?.data?.sort === 1)
+
+    const first = await call('/api/bookmarks', {
+      method: 'POST', token, body: { category_id: catB.id, title: 'Move target first', url: 'https://first.example/' },
+    })
+    const second = await call('/api/bookmarks', {
+      method: 'POST', token, body: { category_id: catB.id, title: 'Move target second', url: 'https://second.example/' },
+    })
+    check('创建两条目标分类夹具', first.json?.code === 0 && second.json?.code === 0)
+
+    const move = await call(`/api/bookmarks/${bm1.id}`, {
+      method: 'PUT', token, body: { ...editBody, category_id: catB.id },
+    })
+    check('编辑移入非空分类 code=0', move.json?.code === 0)
+    check('非空分类使用新的末尾 sort', move.json?.data?.category_id === catB.id && move.json?.data?.sort === 2)
+    const movedList = (await call('/api/bookmarks', { token })).json?.data || []
+    const targetIds = movedList.filter((bookmark) => bookmark.category_id === catB.id).map((bookmark) => bookmark.id)
+    check('回读目标分类为原顺序加移入书签', JSON.stringify(targetIds) === JSON.stringify([first.json?.data?.id, second.json?.data?.id, bm1.id]))
+
+    const sameCategoryEdit = await call(`/api/bookmarks/${bm1.id}`, {
+      method: 'PUT', token, body: { ...editBody, category_id: catB.id, description: '普通编辑保序' },
+    })
+    check('同分类普通编辑保留 sort', sameCategoryEdit.json?.code === 0 && sameCategoryEdit.json?.data?.sort === 2)
+
+    const moveBack = await call(`/api/bookmarks/${bm1.id}`, {
+      method: 'PUT', token, body: { ...editBody, category_id: catA.id },
+    })
+    check('再次换分类使用当前目标末尾', moveBack.json?.code === 0 && moveBack.json?.data?.sort === 1)
+    const deleteFirst = await call(`/api/bookmarks/${first.json?.data?.id}`, { method: 'DELETE', token })
+    const deleteSecond = await call(`/api/bookmarks/${second.json?.data?.id}`, { method: 'DELETE', token })
+    check('清理目标分类夹具', deleteFirst.json?.code === 0 && deleteSecond.json?.code === 0)
+  }
+
   // 写后只确认版本的前提（代码审查三轮第 31 项）：写响应包络上的 data_version 就是随后
   // /api/data/version 报告的版本，且写接口返回的行与 /api/admin/data 里的同一行一致。
   section('写响应 data_version 与本地应用一致性')
@@ -230,6 +275,19 @@ async function main() {
         check('后台聚合携带同一 icon_epoch', admin.json?.data?.icon_epoch === afterCreate)
         const row = admin.json?.data?.bookmarks?.find(item => item.id === id)
         check('聚合返回轻量版本而非完整 icon_blob', row !== undefined && row.icon_blob === null)
+        const edit = await call(`/api/bookmarks/${id}`, { token })
+        check('单条编辑返回完整原始字段', edit.json?.code === 0 && edit.json.data.id === id && edit.json.data.icon === icon && edit.json.data.is_private === 1)
+        check('单条编辑不返回缓存图片正文', edit.json?.data && !Object.hasOwn(edit.json.data, 'icon_blob'))
+        check('单条编辑禁止缓存', edit.headers.get('Cache-Control') === 'private, no-store')
+        check('单条编辑携带服务端耗时', /auth;dur=/.test(edit.headers.get('Server-Timing') || '') && /db;dur=/.test(edit.headers.get('Server-Timing') || ''))
+        check('后台聚合携带服务端耗时', /db;dur=/.test(admin.headers.get('Server-Timing') || ''))
+        const anonymousEdit = await call(`/api/bookmarks/${id}`)
+        check('单条编辑拒绝匿名访问', anonymousEdit.status === 401 && anonymousEdit.json?.code === 1001)
+        const missingEdit = await call('/api/bookmarks/2147483647', { token })
+        check('单条编辑不存在返回 1003', missingEdit.json?.code === 1003)
+        const invalidEdit = await call('/api/bookmarks/invalid', { token })
+        check('单条编辑无效编号返回 1002', invalidEdit.json?.code === 1002)
+        check('单条读取不递增 icon_epoch', await epochOf() === afterCreate)
         await call('/api/public/bookmarks/' + id + '/click', { method: 'POST' })
         check('点击不递增 icon_epoch', await epochOf() === afterCreate)
         const changed = await call('/api/bookmarks/' + id, { method: 'PUT', token, body: { category_id: catA.id, title: 'Changed epoch fixture', url: 'https://example.com', icon: null, is_private: true } })
@@ -359,6 +417,51 @@ async function main() {
     // 非法 background.type 应被拒绝
     const r = await call('/api/settings', { method: 'PUT', token, body: { background: { type: 'video' } } })
     check('非法 background.type 被拒绝', r.json?.code === 1002, `code=${r.json?.code}`)
+  }
+
+  // 浏览器扩展逐条确认分类；旧客户端不传 category_id 时仍使用默认收件分类。
+  section('浏览器同步分类选择')
+  {
+    const enabled = await call('/api/settings', { method: 'PUT', token, body: { browser_sync_enabled: true } })
+    check('开启浏览器同步', enabled.json?.code === 0)
+    const preflight = await call('/api/categories', {
+      method: 'OPTIONS',
+      headers: { origin: 'chrome-extension://cf-navs-test', 'access-control-request-method': 'GET' },
+    })
+    check('扩展可预检分类列表', preflight.status === 204 && preflight.headers.get('access-control-allow-origin') === '*')
+    const categories = await call('/api/categories', { token, headers: { origin: 'chrome-extension://cf-navs-test' } })
+    check('分类列表鉴权响应带 CORS', categories.json?.code === 0 && categories.headers.get('access-control-allow-origin') === '*')
+
+    const selected = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { category_id: catA.id, bookmarks: [{ title: 'Selected category', url: 'https://selected.example' }] },
+    })
+    check('同步到显式选择的分类', selected.json?.code === 0 && selected.json?.data?.category_id === catA.id, JSON.stringify(selected.json))
+    const selectedRows = (await call('/api/bookmarks', { token })).json?.data || []
+    const selectedRow = selectedRows.find(item => item.url === 'https://selected.example')
+    check('书签实际写入所选分类', selectedRow?.category_id === catA.id, JSON.stringify({ catA, selectedRows }))
+
+    const missing = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { category_id: 999999, bookmarks: [{ title: 'Missing category', url: 'https://missing.example' }] },
+    })
+    check('不存在的分类返回 1003', missing.json?.code === 1003)
+    const missingRow = (await call('/api/bookmarks', { token })).json?.data?.find(item => item.url === 'https://missing.example')
+    check('无效分类不会静默写入默认分类', missingRow === undefined)
+
+    const legacy = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { bookmarks: [{ title: 'Legacy category', url: 'https://legacy.example' }] },
+    })
+    check('旧客户端仍同步到默认分类', legacy.json?.code === 0 && legacy.json?.data?.category_title === '浏览器新增收藏')
+    const invalid = await call('/api/browser-sync/bookmarks', {
+      method: 'POST', token,
+      body: { category_id: -1, bookmarks: [{ title: 'Invalid category', url: 'https://invalid.example' }] },
+    })
+    check('非法 category_id 返回 1002', invalid.json?.code === 1002)
+    if (selectedRow?.id) await call(`/api/bookmarks/${selectedRow.id}`, { method: 'DELETE', token })
+    const legacyRow = (await call('/api/bookmarks', { token })).json?.data?.find(item => item.url === 'https://legacy.example')
+    if (legacyRow?.id) await call(`/api/bookmarks/${legacyRow.id}`, { method: 'DELETE', token })
   }
 
   // 9. public/data（公开模式开）
